@@ -194,7 +194,7 @@ Acceptance: site loads with no backend, charts show real history, every chart st
 - 7.2 Methodology review: read every normalizer against METHODOLOGY.md, fix labels that overpromise.
 - 7.3 Hugging Face dataset mirror of the public Parquet, synced on a schedule.
 - 7.4 Upstream PRs: Lambda capacity flag into the SkyPilot catalog fetcher; a gpuhunt issue or PR where the data shows value.
-- 7.5 Announce. Move the repo to a gputick org if a second contributor has not already forced it.
+- 7.5 Announce. Transfer the repo to the `Ad-Astra-Sols` organization if adoption or a second contributor warrants it, and update the citation URL in METHODOLOGY.md and DATA_LICENSE.
 
 Acceptance: 90 days with no gap longer than one cadence in the manifest log for the two inherited upstreams; at least one upstream PR opened; DATA_LICENSE and attribution visible on the site, the Hugging Face card and the API.
 
@@ -208,8 +208,8 @@ Phase 0:
 - [x] Add `.github/workflows/ci.yml`: golangci-lint, `go test -race ./...`, `go build ./...`, on push and PR.
 - [x] Add `.golangci.yml` and `.gitignore` (binaries, `data/`, `.env`, Terraform state and `.terraform/`).
 - [x] Inject version via `-ldflags` from the `Makefile` build target. The release workflow is a Phase 1 task.
-- [ ] Create `pkg/schema` with `Observation`, `PriceType`, `FormFactor`, `Availability`, matching SCHEMA.md; add a test that asserts the enum values.
-- [ ] Create empty packages with `doc.go` for `internal/{collect,source,normalize,store,rollup,api,mcp}` so the layout is visible.
+- [x] Create `pkg/schema` with `Observation`, `PriceType`, `FormFactor`, `Availability`, matching SCHEMA.md; add a test that asserts the enum values.
+- [x] Placeholder `doc.go` packages: skipped on purpose. Each `internal/` package appears with its first real code.
 - [ ] Register gputick.dev. Record the registrar and renewal date in a private note, not the repo.
 - [ ] Create the GitHub Project board from this document's phases.
 
@@ -315,7 +315,7 @@ Short ADR-style entries. Dates are the day the decision was recorded.
 
 **2026-10-23 Apache-2.0 code, CC-BY-4.0 data.** Decision: code under Apache-2.0, dataset under CC-BY-4.0 in `DATA_LICENSE`, attribution to SkyPilot and gpuhunt. Data is never committed to the repo. Consequence: anyone can use the data commercially with attribution; the license travels with the Parquet and the API.
 
-**2026-10-23 Personal repo first, org later.** Decision: `github.com/HMetcalfeW/gputick` now; move to a `gputick` org at the second contributor or at announcement, whichever comes first. GitHub preserves redirects.
+**2026-10-23 Personal repo until adoption (revised 2026-10-24).** Decision: `github.com/HMetcalfeW/gputick` stays under the owner's personal account until collection works and the project has some adoption. It then transfers to the owner's existing `Ad-Astra-Sols` organization rather than to a new `gputick` organization. Reason: the LLC already owns the domain and billing, and a project-named organization adds administration without adding anything the personal account or the LLC organization lacks. GitHub preserves redirects on transfer, so the only cleanup is the citation URL in the docs.
 
 **2026-10-23 Name: gputick.** Decision: gputick, domain gputick.dev. Runner-up `computetick` kept in reserve if coverage grows past GPUs.
 
