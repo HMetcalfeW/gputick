@@ -1,0 +1,33 @@
+# Build output
+bin/
+/gputick
+
+# Test and coverage output
+coverage.out
+
+# Data is never committed
+data/
+*.parquet
+
+# Environment and secrets
+.env
+*.env
+
+# Terraform (.terraform.lock.hcl is committed on purpose)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.example.tfvars
+
+# Web
+node_modules/
+web/dist/
+
+# macOS
+.DS_Store
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
