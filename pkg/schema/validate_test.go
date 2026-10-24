@@ -22,7 +22,7 @@ func TestObservation_Validate_ExampleRowsPass(t *testing.T) {
 	b.ZoneRaw = ptr("us-east-1a")
 	b.PriceType, b.Tier = schema.PriceTypeDynamicSpot, "spot"
 	b.PriceOriginal, b.PriceUSDPerGPUHour = 33.28, 4.16
-	b.Availability = schema.Availability{Signal: schema.SignalPlacementScore, Value: ptr("7")}
+	b.SetAvailability(schema.Availability{Signal: schema.SignalPlacementScore, Value: ptr("7")})
 	require.NoError(t, b.Validate())
 
 	c := rowD(t)
@@ -32,7 +32,7 @@ func TestObservation_Validate_ExampleRowsPass(t *testing.T) {
 	c.RegionRaw, c.RegionBucket = "Texas, US", schema.RegionUSCentral
 	c.PriceType, c.PriceStat = schema.PriceTypeMarketplaceAsk, schema.PriceStatMin
 	c.PriceBasis, c.PriceOriginal, c.PriceUSDPerGPUHour = schema.PriceBasisPerGPUHour, 0.34, 0.34
-	c.Availability = schema.Availability{Signal: schema.SignalOfferCount, Value: ptr("212"), Available: ptr(true)}
+	c.SetAvailability(schema.Availability{Signal: schema.SignalOfferCount, Value: ptr("212"), Available: ptr(true)})
 	require.NoError(t, c.Validate())
 }
 
@@ -43,7 +43,13 @@ func TestObservation_Validate_RejectsViolations(t *testing.T) {
 		wantErr string
 	}{
 		{"zero observed_at", func(o *schema.Observation) { o.ObservedAt = time.Time{} }, "observed_at is zero"},
+		{"local observed_at", func(o *schema.Observation) { o.ObservedAt = o.ObservedAt.In(time.FixedZone("EDT", -4*3600)) }, "observed_at must be UTC"},
+		{"local stale_since", func(o *schema.Observation) {
+			o.Stale = true
+			o.StaleSince = ptr(o.ObservedAt.In(time.FixedZone("EDT", -4*3600)))
+		}, "stale_since must be UTC"},
 		{"empty run_id", func(o *schema.Observation) { o.RunID = "" }, "run_id is empty"},
+		{"malformed run_id", func(o *schema.Observation) { o.RunID = "run-1" }, "does not match"},
 		{"empty tier", func(o *schema.Observation) { o.Tier = "" }, "tier is empty"},
 		{"bad form_factor", func(o *schema.Observation) { o.FormFactor = "SXM" }, `form_factor "SXM"`},
 		{"bad interconnect", func(o *schema.Observation) { o.Interconnect = "" }, `interconnect ""`},
@@ -61,10 +67,10 @@ func TestObservation_Validate_RejectsViolations(t *testing.T) {
 		{"since without stale", func(o *schema.Observation) { o.StaleSince = ptr(o.ObservedAt) }, "stale_since must be null"},
 		{"available contradicts value", func(o *schema.Observation) { o.Available = ptr(true) }, "does not match derivation"},
 		{"value for signal none", func(o *schema.Observation) {
-			o.Availability = schema.Availability{Signal: schema.SignalNone, Value: ptr("1")}
+			o.SetAvailability(schema.Availability{Signal: schema.SignalNone, Value: ptr("1")})
 		}, "value must be null for signal none"},
 		{"inferred signal", func(o *schema.Observation) {
-			o.Availability = schema.Availability{Signal: schema.SignalInferred}
+			o.SetAvailability(schema.Availability{Signal: schema.SignalInferred})
 		}, "inferred availability signals are not defined"},
 	}
 	for _, tt := range tests {
@@ -128,6 +134,16 @@ func TestAvailability_DeriveAvailable(t *testing.T) {
 	}
 }
 
+func TestCheckUTC(t *testing.T) {
+	at := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, schema.CheckUTC("t", at))
+	require.NoError(t, schema.CheckUTC("t", at.In(time.FixedZone("UTC-named-differently", 0))),
+		"any zero-offset location serializes with a Z suffix, so time.Now() on a UTC host passes")
+	err := schema.CheckUTC("started_at", at.In(time.FixedZone("EDT", -4*3600)))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "started_at must be UTC, got offset -14400 seconds")
+}
+
 func TestAvailability_Validate_UnknownSignal(t *testing.T) {
 	err := schema.Availability{Signal: "stock"}.Validate()
 	require.Error(t, err)
@@ -168,6 +184,9 @@ func manifest(t *testing.T) schema.RunManifest {
 func TestRunManifest_ValidateAndJSON(t *testing.T) {
 	m := manifest(t)
 	require.NoError(t, m.Validate())
+	shifted := manifest(t)
+	shifted.StartedAt = shifted.StartedAt.Add(900 * time.Millisecond)
+	require.NoError(t, shifted.Validate(), "started_at matches the run_id prefix to the second")
 
 	data, err := json.Marshal(m)
 	require.NoError(t, err)
@@ -185,6 +204,11 @@ func TestRunManifest_Validate_RejectsViolations(t *testing.T) {
 		wantErr string
 	}{
 		{"empty run_id", func(m *schema.RunManifest) { m.RunID = "" }, "run_id is empty"},
+		{"malformed run_id", func(m *schema.RunManifest) { m.RunID = "2026-10-24" }, "does not match"},
+		{"run_id disagrees with started_at", func(m *schema.RunManifest) { m.StartedAt = m.StartedAt.Add(time.Hour) }, "run_id prefix 2026-10-24T12:00:00Z does not match started_at"},
+		{"local started_at", func(m *schema.RunManifest) { m.StartedAt = m.StartedAt.In(time.FixedZone("EDT", -4*3600)) }, "started_at must be UTC"},
+		{"local finished_at", func(m *schema.RunManifest) { m.FinishedAt = m.FinishedAt.Local() }, "finished_at must be UTC"},
+		{"local source finished_at", func(m *schema.RunManifest) { m.Sources[0].FinishedAt = m.Sources[0].FinishedAt.Local() }, "sources[0]: finished_at must be UTC"},
 		{"finished before started", func(m *schema.RunManifest) { m.FinishedAt = m.StartedAt.Add(-time.Second) }, "finished_at is before started_at"},
 		{"bad status", func(m *schema.RunManifest) { m.Status = "timeout" }, `status "timeout"`},
 		{"failed with path", func(m *schema.RunManifest) { m.Status = schema.RunStatusFailed }, "observations_path must be null"},

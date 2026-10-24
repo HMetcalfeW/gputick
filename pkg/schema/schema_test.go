@@ -38,11 +38,9 @@ func rowD(t *testing.T) schema.Observation {
 		CurrencyOriginal:   "USD",
 		MinCommitmentHours: 0,
 		Bundled:            false,
-		Availability: schema.Availability{
-			Signal:    schema.SignalCapacityFlag,
-			Value:     ptr("false"),
-			Available: ptr(false),
-		},
+		AvailabilitySignal: schema.SignalCapacityFlag,
+		AvailabilityValue:  ptr("false"),
+		Available:          ptr(false),
 		MethodologyVersion: schema.MethodologyVersion,
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 var (
@@ -18,6 +19,8 @@ func (o Observation) Validate() error {
 	var errs []error
 	if o.ObservedAt.IsZero() {
 		errs = append(errs, errors.New("observed_at is zero"))
+	} else {
+		errs = appendErr(errs, CheckUTC("observed_at", o.ObservedAt))
 	}
 	for name, v := range map[string]string{
 		"run_id": o.RunID, "source": o.Source, "provider": o.Provider,
@@ -29,9 +32,14 @@ func (o Observation) Validate() error {
 			errs = append(errs, fmt.Errorf("%s is empty", name))
 		}
 	}
+	if o.RunID != "" {
+		if _, err := RunIDTime(o.RunID); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	errs = append(errs, o.validateEnums()...)
 	errs = append(errs, o.validateNumbers()...)
-	if err := o.Availability.Validate(); err != nil {
+	if err := o.Availability().Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	if o.Stale && o.StaleSince == nil {
@@ -40,7 +48,28 @@ func (o Observation) Validate() error {
 	if !o.Stale && o.StaleSince != nil {
 		errs = append(errs, errors.New("stale_since must be null when stale is false"))
 	}
+	if o.StaleSince != nil {
+		errs = appendErr(errs, CheckUTC("stale_since", *o.StaleSince))
+	}
 	return errors.Join(errs...)
+}
+
+// CheckUTC reports an error when t has a non-zero UTC offset. The contract
+// requires timestamps to serialize with a Z suffix, which encoding/json does
+// for any zero-offset time, so time.Now() on a UTC host passes and a local
+// time elsewhere does not.
+func CheckUTC(name string, t time.Time) error {
+	if _, offset := t.Zone(); offset != 0 {
+		return fmt.Errorf("%s must be UTC, got offset %+d seconds; call .UTC() before writing", name, offset)
+	}
+	return nil
+}
+
+func appendErr(errs []error, err error) []error {
+	if err != nil {
+		return append(errs, err)
+	}
+	return errs
 }
 
 func (o Observation) validateNumbers() []error {
