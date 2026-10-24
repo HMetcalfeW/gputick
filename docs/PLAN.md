@@ -74,30 +74,39 @@ The upstream schema version is recorded in the raw envelope's `upstream_version`
 Proposed shapes, to be finalized in code during Phase 1:
 
 ```go
-// internal/source
+// internal/source (landed in Phase 1)
 type Source interface {
     Name() string
     Fetch(ctx context.Context) (RawResult, error)
 }
 
-type RawResult struct {
-    Rows []RawRow   // map[string]string per row; upstream column names kept as-is
-    Meta FetchMeta  // FetchedAt, UpstreamVersion, URL or key, ETag, Bytes, Duration
+type RawRow map[string]string
+
+type Part struct {           // one upstream request: a file, an S3 key or an API call
+    Ref, UpstreamVersion string
+    FetchedAt            time.Time
+    Bytes                int64
+    SHA256               string
+    Columns              []string // upstream header order
+    Rows                 []RawRow
 }
 
+type RawResult struct{ Parts []Part }   // RowCount, Columns, SHA256, UpstreamVersion, FetchedAt helpers
+
+// internal/normalize (Phase 3, proposed)
 type Normalizer interface {
-    Normalize(raw RawResult) ([]schema.Observation, []Issue, error)
+    Normalize(raw source.RawResult) ([]schema.Observation, []Issue, error)
 }
 
-// internal/store
+// internal/store (landed in Phase 1); each method returns the object key it wrote
 type Store interface {
-    WriteRaw(ctx context.Context, run RunID, source string, raw RawResult) error
-    WriteObservations(ctx context.Context, run RunID, obs []schema.Observation) error
-    WriteManifest(ctx context.Context, m RunManifest) error
+    WriteRaw(ctx context.Context, runID, sourceName string, raw source.RawResult) (string, error)
+    WriteObservations(ctx context.Context, runID string, obs []schema.Observation) (string, error)
+    WriteManifest(ctx context.Context, m schema.RunManifest) (string, error)
 }
 ```
 
-Raw rows are kept as strings on purpose. Typing happens in the normalizer, so an upstream that changes a column's type or adds a column cannot break the raw write.
+Raw rows are kept as strings on purpose. Typing happens in the normalizer, so an upstream that changes a column's type or adds a column cannot break the raw write. A source that reads several files returns one `Part` per file; they share one raw object per source per run, and each row's envelope records which part it came from. Raw and manifest keys are write-once (`store.ErrExists`); observation keys may be overwritten by re-derivation.
 
 ### How `gputick collect` runs
 
@@ -215,9 +224,9 @@ Phase 0:
 
 Phase 1:
 
-- [ ] Define `Source`, `RawResult`, `RawRow`, `FetchMeta` in `internal/source`.
-- [ ] Define `Store` with `WriteRaw`, `WriteObservations`, `WriteManifest` in `internal/store`.
-- [ ] Implement `store/fs`: Parquet writer via parquet-go, partition path builder, atomic rename on write.
+- [x] Define `Source`, `RawResult`, `RawRow` and `Part` (per-request fetch metadata) in `internal/source`.
+- [x] Define `Store` with `WriteRaw`, `WriteObservations`, `WriteManifest` in `internal/store`, plus the partition path builders.
+- [x] Implement `store/fs`: Parquet writer via parquet-go, partition path builder, atomic rename on write.
 - [ ] Implement `source/skypilot`: pin catalog version `v<N>`, list clouds, fetch each CSV over raw GitHub, record ETag and commit if available.
 - [ ] Record SkyPilot fixtures (one trimmed CSV per cloud) and write a contract test asserting the column set.
 - [ ] Implement `source/gpuhunt`: read `v3/<provider>/version`, fetch the zip, unzip in memory, one `RawResult` per provider CSV.

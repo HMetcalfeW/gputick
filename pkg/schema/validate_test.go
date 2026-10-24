@@ -22,7 +22,7 @@ func TestObservation_Validate_ExampleRowsPass(t *testing.T) {
 	b.ZoneRaw = ptr("us-east-1a")
 	b.PriceType, b.Tier = schema.PriceTypeDynamicSpot, "spot"
 	b.PriceOriginal, b.PriceUSDPerGPUHour = 33.28, 4.16
-	b.Availability = schema.Availability{Signal: schema.SignalPlacementScore, Value: ptr("7")}
+	b.SetAvailability(schema.Availability{Signal: schema.SignalPlacementScore, Value: ptr("7")})
 	require.NoError(t, b.Validate())
 
 	c := rowD(t)
@@ -32,7 +32,7 @@ func TestObservation_Validate_ExampleRowsPass(t *testing.T) {
 	c.RegionRaw, c.RegionBucket = "Texas, US", schema.RegionUSCentral
 	c.PriceType, c.PriceStat = schema.PriceTypeMarketplaceAsk, schema.PriceStatMin
 	c.PriceBasis, c.PriceOriginal, c.PriceUSDPerGPUHour = schema.PriceBasisPerGPUHour, 0.34, 0.34
-	c.Availability = schema.Availability{Signal: schema.SignalOfferCount, Value: ptr("212"), Available: ptr(true)}
+	c.SetAvailability(schema.Availability{Signal: schema.SignalOfferCount, Value: ptr("212"), Available: ptr(true)})
 	require.NoError(t, c.Validate())
 }
 
@@ -44,6 +44,7 @@ func TestObservation_Validate_RejectsViolations(t *testing.T) {
 	}{
 		{"zero observed_at", func(o *schema.Observation) { o.ObservedAt = time.Time{} }, "observed_at is zero"},
 		{"empty run_id", func(o *schema.Observation) { o.RunID = "" }, "run_id is empty"},
+		{"malformed run_id", func(o *schema.Observation) { o.RunID = "run-1" }, "does not match"},
 		{"empty tier", func(o *schema.Observation) { o.Tier = "" }, "tier is empty"},
 		{"bad form_factor", func(o *schema.Observation) { o.FormFactor = "SXM" }, `form_factor "SXM"`},
 		{"bad interconnect", func(o *schema.Observation) { o.Interconnect = "" }, `interconnect ""`},
@@ -61,10 +62,10 @@ func TestObservation_Validate_RejectsViolations(t *testing.T) {
 		{"since without stale", func(o *schema.Observation) { o.StaleSince = ptr(o.ObservedAt) }, "stale_since must be null"},
 		{"available contradicts value", func(o *schema.Observation) { o.Available = ptr(true) }, "does not match derivation"},
 		{"value for signal none", func(o *schema.Observation) {
-			o.Availability = schema.Availability{Signal: schema.SignalNone, Value: ptr("1")}
+			o.SetAvailability(schema.Availability{Signal: schema.SignalNone, Value: ptr("1")})
 		}, "value must be null for signal none"},
 		{"inferred signal", func(o *schema.Observation) {
-			o.Availability = schema.Availability{Signal: schema.SignalInferred}
+			o.SetAvailability(schema.Availability{Signal: schema.SignalInferred})
 		}, "inferred availability signals are not defined"},
 	}
 	for _, tt := range tests {
@@ -185,6 +186,7 @@ func TestRunManifest_Validate_RejectsViolations(t *testing.T) {
 		wantErr string
 	}{
 		{"empty run_id", func(m *schema.RunManifest) { m.RunID = "" }, "run_id is empty"},
+		{"malformed run_id", func(m *schema.RunManifest) { m.RunID = "2026-10-24" }, "does not match"},
 		{"finished before started", func(m *schema.RunManifest) { m.FinishedAt = m.StartedAt.Add(-time.Second) }, "finished_at is before started_at"},
 		{"bad status", func(m *schema.RunManifest) { m.Status = "timeout" }, `status "timeout"`},
 		{"failed with path", func(m *schema.RunManifest) { m.Status = schema.RunStatusFailed }, "observations_path must be null"},

@@ -43,6 +43,8 @@ func (m RunManifest) Validate() error {
 	var errs []error
 	if m.RunID == "" {
 		errs = append(errs, errors.New("run_id is empty"))
+	} else if _, err := RunIDTime(m.RunID); err != nil {
+		errs = append(errs, err)
 	}
 	if m.FinishedAt.Before(m.StartedAt) {
 		errs = append(errs, errors.New("finished_at is before started_at"))

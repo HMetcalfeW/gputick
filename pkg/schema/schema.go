@@ -114,10 +114,11 @@ func (v RegionBucket) Valid() bool       { _, ok := regionBuckets[v]; return ok 
 func (v RunStatus) Valid() bool          { _, ok := runStatuses[v]; return ok }
 func (v SourceRunStatus) Valid() bool    { _, ok := sourceRunStatuses[v]; return ok }
 
-// Availability is the provider-reported signal attached to an observation.
-// It is embedded in Observation and flattened to top-level columns by both
-// encoding/json and parquet-go. Value is encoded per signal; see
-// docs/SCHEMA.md section 3 and DeriveAvailable.
+// Availability groups the three availability columns of an observation for
+// validation and derivation. Observation carries the columns directly rather
+// than embedding this type, because parquet-go 0.32 reads null optional fields
+// of an anonymous embedded struct back as non-nil zero values. Value is
+// encoded per signal; see docs/SCHEMA.md section 3 and DeriveAvailable.
 type Availability struct {
 	Signal    AvailabilitySignal `parquet:"availability_signal" json:"availability_signal"`
 	Value     *string            `parquet:"availability_value"  json:"availability_value"`
@@ -128,36 +129,48 @@ type Availability struct {
 // about one series in one collection run. Field order matches docs/SCHEMA.md
 // so JSON output reads in the documented order.
 type Observation struct {
-	ObservedAt         time.Time    `parquet:"observed_at,timestamp(microsecond)" json:"observed_at"`
-	RunID              string       `parquet:"run_id"                             json:"run_id"`
-	Source             string       `parquet:"source"                             json:"source"`
-	Provider           string       `parquet:"provider"                           json:"provider"`
-	GPUSlug            string       `parquet:"gpu_slug"                           json:"gpu_slug"`
-	GPUVendor          string       `parquet:"gpu_vendor"                         json:"gpu_vendor"`
-	GPUModel           string       `parquet:"gpu_model"                          json:"gpu_model"`
-	FormFactor         FormFactor   `parquet:"form_factor"                        json:"form_factor"`
-	GPUMemoryGB        int32        `parquet:"gpu_memory_gb"                      json:"gpu_memory_gb"`
-	Interconnect       Interconnect `parquet:"interconnect"                       json:"interconnect"`
-	NodeGPUCount       int32        `parquet:"node_gpu_count"                     json:"node_gpu_count"`
-	InstanceType       *string      `parquet:"instance_type"                      json:"instance_type"`
-	RegionRaw          string       `parquet:"region_raw"                         json:"region_raw"`
-	ZoneRaw            *string      `parquet:"zone_raw"                           json:"zone_raw"`
-	RegionBucket       RegionBucket `parquet:"region_bucket"                      json:"region_bucket"`
-	PriceType          PriceType    `parquet:"price_type"                         json:"price_type"`
-	Tier               string       `parquet:"tier"                               json:"tier"`
-	PriceStat          PriceStat    `parquet:"price_stat"                         json:"price_stat"`
-	PriceUSDPerGPUHour float64      `parquet:"price_usd_per_gpu_hour"             json:"price_usd_per_gpu_hour"`
-	PriceBasis         PriceBasis   `parquet:"price_basis"                        json:"price_basis"`
-	PriceOriginal      float64      `parquet:"price_original"                     json:"price_original"`
-	CurrencyOriginal   string       `parquet:"currency_original"                  json:"currency_original"`
-	FXRateToUSD        *float64     `parquet:"fx_rate_to_usd"                     json:"fx_rate_to_usd"`
-	MinCommitmentHours int32        `parquet:"min_commitment_hours"               json:"min_commitment_hours"`
-	Bundled            bool         `parquet:"bundled"                            json:"bundled"`
-	Availability
-	Stale              bool       `parquet:"stale"                               json:"stale"`
-	StaleSince         *time.Time `parquet:"stale_since,timestamp(microsecond)"  json:"stale_since"`
-	MethodologyVersion string     `parquet:"methodology_version"                 json:"methodology_version"`
-	UpstreamVersion    *string    `parquet:"upstream_version"                    json:"upstream_version"`
+	ObservedAt         time.Time          `parquet:"observed_at,timestamp(microsecond)" json:"observed_at"`
+	RunID              string             `parquet:"run_id"                             json:"run_id"`
+	Source             string             `parquet:"source"                             json:"source"`
+	Provider           string             `parquet:"provider"                           json:"provider"`
+	GPUSlug            string             `parquet:"gpu_slug"                           json:"gpu_slug"`
+	GPUVendor          string             `parquet:"gpu_vendor"                         json:"gpu_vendor"`
+	GPUModel           string             `parquet:"gpu_model"                          json:"gpu_model"`
+	FormFactor         FormFactor         `parquet:"form_factor"                        json:"form_factor"`
+	GPUMemoryGB        int32              `parquet:"gpu_memory_gb"                      json:"gpu_memory_gb"`
+	Interconnect       Interconnect       `parquet:"interconnect"                       json:"interconnect"`
+	NodeGPUCount       int32              `parquet:"node_gpu_count"                     json:"node_gpu_count"`
+	InstanceType       *string            `parquet:"instance_type"                      json:"instance_type"`
+	RegionRaw          string             `parquet:"region_raw"                         json:"region_raw"`
+	ZoneRaw            *string            `parquet:"zone_raw"                           json:"zone_raw"`
+	RegionBucket       RegionBucket       `parquet:"region_bucket"                      json:"region_bucket"`
+	PriceType          PriceType          `parquet:"price_type"                         json:"price_type"`
+	Tier               string             `parquet:"tier"                               json:"tier"`
+	PriceStat          PriceStat          `parquet:"price_stat"                         json:"price_stat"`
+	PriceUSDPerGPUHour float64            `parquet:"price_usd_per_gpu_hour"             json:"price_usd_per_gpu_hour"`
+	PriceBasis         PriceBasis         `parquet:"price_basis"                        json:"price_basis"`
+	PriceOriginal      float64            `parquet:"price_original"                     json:"price_original"`
+	CurrencyOriginal   string             `parquet:"currency_original"                  json:"currency_original"`
+	FXRateToUSD        *float64           `parquet:"fx_rate_to_usd"                     json:"fx_rate_to_usd"`
+	MinCommitmentHours int32              `parquet:"min_commitment_hours"               json:"min_commitment_hours"`
+	Bundled            bool               `parquet:"bundled"                            json:"bundled"`
+	AvailabilitySignal AvailabilitySignal `parquet:"availability_signal"                json:"availability_signal"`
+	AvailabilityValue  *string            `parquet:"availability_value"                 json:"availability_value"`
+	Available          *bool              `parquet:"available"                          json:"available"`
+	Stale              bool               `parquet:"stale"                              json:"stale"`
+	StaleSince         *time.Time         `parquet:"stale_since,timestamp(microsecond)" json:"stale_since"`
+	MethodologyVersion string             `parquet:"methodology_version"                json:"methodology_version"`
+	UpstreamVersion    *string            `parquet:"upstream_version"                   json:"upstream_version"`
+}
+
+// Availability returns the observation's three availability columns as one value.
+func (o Observation) Availability() Availability {
+	return Availability{Signal: o.AvailabilitySignal, Value: o.AvailabilityValue, Available: o.Available}
+}
+
+// SetAvailability stores a into the observation's three availability columns.
+func (o *Observation) SetAvailability(a Availability) {
+	o.AvailabilitySignal, o.AvailabilityValue, o.Available = a.Signal, a.Value, a.Available
 }
 
 // Source describes one feed gputick reads. It backs the source table in

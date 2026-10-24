@@ -19,7 +19,7 @@ This document is the field-level contract for the artifacts gputick writes: raw 
   PriceUSDPerGPUHour float64 `parquet:"price_usd_per_gpu_hour" json:"price_usd_per_gpu_hour"`
   ```
 
-  Timestamp fields carry `parquet:"<name>,timestamp(microsecond)"`. `Availability` groups the three availability fields in Go and is embedded anonymously in `Observation`; both `encoding/json` and parquet-go flatten anonymous embedded structs to top-level columns, and both treat pointer fields as nullable. `Source` describes a feed (slug, license, fetch method, auth, cadence) and backs the source table in METHODOLOGY section 10.
+  Timestamp fields carry `parquet:"<name>,timestamp(microsecond)"`, and pointer fields are the nullable columns. `Observation` carries the three availability columns directly; `Availability` is a value type that `Observation.Availability()` returns and `SetAvailability` stores, used for validation and derivation. Embedding it was tried and dropped because parquet-go 0.32 reads null optional fields of an anonymous embedded struct back as non-nil zero values. `Source` describes a feed (slug, license, fetch method, auth, cadence) and backs the source table in METHODOLOGY section 10.
 - Enumerations are typed strings in Go: `PriceType`, `AvailabilitySignal`, `FormFactor`, `Interconnect`, `PriceBasis`, `PriceStat`, `RegionBucket`, `RunStatus` and `SourceRunStatus`, each with a `Valid` method. Values marked proposed in METHODOLOGY.md (for example `oam`, or the `us` and `eu` fallback buckets) are not members until adopted.
 - `Observation.Validate` and `RunManifest.Validate` enforce the required fields, enumeration membership, the `availability_value` encoding and `available` derivation in section 3, the staleness invariants, and the manifest rules in section 4. `Availability.DeriveAvailable` is the reference implementation of the derivation table. Normalizers must call `Validate` before writing a row.
 - Types used below and their encodings:
@@ -34,8 +34,8 @@ This document is the field-level contract for the artifacts gputick writes: raw 
 
 - Nullable fields are Parquet nulls and JSON `null`. Every field is always present in JSON; a missing key is a bug, not a null.
 - Enumerations are lowercase strings and are never stored as integer codes.
-- Parquet files use zstd compression (proposed).
-- `run_id` identifies one collection cycle across all artifacts. Format (proposed): `<YYYYMMDD>T<HHMMSS>Z-<8 lowercase hex>`, for example `20261024T120000Z-3f9a1c2e`. It sorts chronologically as a string and is safe in object keys.
+- Parquet files use zstd compression.
+- `run_id` identifies one collection cycle across all artifacts. Format: `<YYYYMMDD>T<HHMMSS>Z-<8 lowercase hex>`, for example `20261024T120000Z-3f9a1c2e`. The prefix is the run's `started_at` in UTC, so partitions are derived from the id alone. It sorts chronologically as a string and is safe in object keys. `schema.NewRunID` and `schema.RunIDTime` implement it, and `Validate` rejects ids in any other format.
 
 ## 2. Raw snapshot contract
 
@@ -53,7 +53,7 @@ Every raw file begins with these envelope columns:
 
 Payload columns follow the envelope and are passed through verbatim:
 
-- Tabular upstreams (CSV): one column per upstream column, named exactly as the upstream header, every value typed as `string`. No type inference, trimming, renaming or row filtering happens at this layer. An upstream column whose name collides with an envelope column is prefixed with `payload_`.
+- Tabular upstreams (CSV): one column per upstream column, named exactly as the upstream header, every value typed as `string`. No type inference, trimming, renaming or row filtering happens at this layer. An upstream column whose name collides with an envelope column, or with a name already assigned, is prefixed with `payload_` until it is free, and an empty header is named `unnamed_<n>` by its zero-based position. A repeated header cannot be a row key, so source adapters rename repeats with a `_<n>` suffix from the second occurrence on (`source.UniqueColumns`) before rows are built. When a source returns several parts (one file or endpoint each), their rows share one raw file and each row's `upstream_ref` and `fetched_at` come from its own part; a column one part lacks is null in that part's rows.
 - JSON upstreams (REST and GraphQL APIs): one row per top-level record, with the record serialized verbatim into a single `payload_json` string column.
 - HTML upstreams (planned scrapers): one row per extracted price cell, with the extracted text in `payload_text`, the selector that produced it in `selector`, and the SHA-256 of the fetched page body in `page_sha256`.
 

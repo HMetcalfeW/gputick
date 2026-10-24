@@ -29,9 +29,14 @@ func (o Observation) Validate() error {
 			errs = append(errs, fmt.Errorf("%s is empty", name))
 		}
 	}
+	if o.RunID != "" {
+		if _, err := RunIDTime(o.RunID); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	errs = append(errs, o.validateEnums()...)
 	errs = append(errs, o.validateNumbers()...)
-	if err := o.Availability.Validate(); err != nil {
+	if err := o.Availability().Validate(); err != nil {
 		errs = append(errs, err)
 	}
 	if o.Stale && o.StaleSince == nil {
