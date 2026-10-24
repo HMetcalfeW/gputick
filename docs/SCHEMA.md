@@ -19,7 +19,9 @@ This document is the field-level contract for the artifacts gputick writes: raw 
   PriceUSDPerGPUHour float64 `parquet:"price_usd_per_gpu_hour" json:"price_usd_per_gpu_hour"`
   ```
 
-  `Availability` groups the three availability fields in Go and is flattened to top-level columns in Parquet and JSON (proposed). `Source` describes a feed (slug, license, fetch method, auth, cadence) and backs the source table in METHODOLOGY section 10.
+  Timestamp fields carry `parquet:"<name>,timestamp(microsecond)"`. `Availability` groups the three availability fields in Go and is embedded anonymously in `Observation`; both `encoding/json` and parquet-go flatten anonymous embedded structs to top-level columns, and both treat pointer fields as nullable. `Source` describes a feed (slug, license, fetch method, auth, cadence) and backs the source table in METHODOLOGY section 10.
+- Enumerations are typed strings in Go: `PriceType`, `AvailabilitySignal`, `FormFactor`, `Interconnect`, `PriceBasis`, `PriceStat`, `RegionBucket`, `RunStatus` and `SourceRunStatus`, each with a `Valid` method. Values marked proposed in METHODOLOGY.md (for example `oam`, or the `us` and `eu` fallback buckets) are not members until adopted.
+- `Observation.Validate` and `RunManifest.Validate` enforce the required fields, enumeration membership, the `availability_value` encoding and `available` derivation in section 3, the staleness invariants, and the manifest rules in section 4. `Availability.DeriveAvailable` is the reference implementation of the derivation table. Normalizers must call `Validate` before writing a row.
 - Types used below and their encodings:
 
 | Type | Parquet | JSON |
