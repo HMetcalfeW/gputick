@@ -43,6 +43,11 @@ func TestObservation_Validate_RejectsViolations(t *testing.T) {
 		wantErr string
 	}{
 		{"zero observed_at", func(o *schema.Observation) { o.ObservedAt = time.Time{} }, "observed_at is zero"},
+		{"local observed_at", func(o *schema.Observation) { o.ObservedAt = o.ObservedAt.In(time.FixedZone("EDT", -4*3600)) }, "observed_at must be UTC"},
+		{"local stale_since", func(o *schema.Observation) {
+			o.Stale = true
+			o.StaleSince = ptr(o.ObservedAt.In(time.FixedZone("EDT", -4*3600)))
+		}, "stale_since must be UTC"},
 		{"empty run_id", func(o *schema.Observation) { o.RunID = "" }, "run_id is empty"},
 		{"malformed run_id", func(o *schema.Observation) { o.RunID = "run-1" }, "does not match"},
 		{"empty tier", func(o *schema.Observation) { o.Tier = "" }, "tier is empty"},
@@ -169,6 +174,9 @@ func manifest(t *testing.T) schema.RunManifest {
 func TestRunManifest_ValidateAndJSON(t *testing.T) {
 	m := manifest(t)
 	require.NoError(t, m.Validate())
+	shifted := manifest(t)
+	shifted.StartedAt = shifted.StartedAt.Add(900 * time.Millisecond)
+	require.NoError(t, shifted.Validate(), "started_at matches the run_id prefix to the second")
 
 	data, err := json.Marshal(m)
 	require.NoError(t, err)
@@ -187,6 +195,10 @@ func TestRunManifest_Validate_RejectsViolations(t *testing.T) {
 	}{
 		{"empty run_id", func(m *schema.RunManifest) { m.RunID = "" }, "run_id is empty"},
 		{"malformed run_id", func(m *schema.RunManifest) { m.RunID = "2026-10-24" }, "does not match"},
+		{"run_id disagrees with started_at", func(m *schema.RunManifest) { m.StartedAt = m.StartedAt.Add(time.Hour) }, "run_id prefix 2026-10-24T12:00:00Z does not match started_at"},
+		{"local started_at", func(m *schema.RunManifest) { m.StartedAt = m.StartedAt.In(time.FixedZone("EDT", -4*3600)) }, "started_at must be UTC"},
+		{"local finished_at", func(m *schema.RunManifest) { m.FinishedAt = m.FinishedAt.Local() }, "finished_at must be UTC"},
+		{"local source finished_at", func(m *schema.RunManifest) { m.Sources[0].FinishedAt = m.Sources[0].FinishedAt.Local() }, "sources[0]: finished_at must be UTC"},
 		{"finished before started", func(m *schema.RunManifest) { m.FinishedAt = m.StartedAt.Add(-time.Second) }, "finished_at is before started_at"},
 		{"bad status", func(m *schema.RunManifest) { m.Status = "timeout" }, `status "timeout"`},
 		{"failed with path", func(m *schema.RunManifest) { m.Status = schema.RunStatusFailed }, "observations_path must be null"},

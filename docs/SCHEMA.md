@@ -33,9 +33,10 @@ This document is the field-level contract for the artifacts gputick writes: raw 
 | `timestamp` | INT64, TIMESTAMP(MICROS), UTC-adjusted | RFC 3339 string in UTC with a `Z` suffix |
 
 - Nullable fields are Parquet nulls and JSON `null`. Every field is always present in JSON; a missing key is a bug, not a null.
+- All timestamps are UTC. `Validate` rejects a `time.Time` in any other location, because `encoding/json` would otherwise emit an offset instead of the `Z` suffix.
 - Enumerations are lowercase strings and are never stored as integer codes.
 - Parquet files use zstd compression.
-- `run_id` identifies one collection cycle across all artifacts. Format: `<YYYYMMDD>T<HHMMSS>Z-<8 lowercase hex>`, for example `20261024T120000Z-3f9a1c2e`. The prefix is the run's `started_at` in UTC, so partitions are derived from the id alone. It sorts chronologically as a string and is safe in object keys. `schema.NewRunID` and `schema.RunIDTime` implement it, and `Validate` rejects ids in any other format.
+- `run_id` identifies one collection cycle across all artifacts. Format: `<YYYYMMDD>T<HHMMSS>Z-<8 lowercase hex>`, for example `20261024T120000Z-3f9a1c2e`. The prefix is the run's `started_at` in UTC, so partitions are derived from the id alone. It sorts chronologically as a string and is safe in object keys. `schema.NewRunID` and `schema.RunIDTime` implement it, and `Validate` rejects ids in any other format. A manifest's `started_at`, truncated to the second, must equal its `run_id` prefix.
 
 ## 2. Raw snapshot contract
 
@@ -49,13 +50,17 @@ Every raw file begins with these envelope columns:
 | `run_id` | string | no | The run that fetched it. |
 | `fetched_at` | timestamp | no | When the upstream request completed. |
 | `upstream_version` | string | yes | The upstream's own version string where one exists: SkyPilot catalog `v<N>` plus the commit SHA of the fetched file, the contents of the gpuhunt `version` file, an API version header. Null when the upstream exposes none. |
-| `upstream_ref` | string | yes | The URL, S3 key or API operation name the record came from, with credentials removed. A source that calls more than one endpoint (for example `aws`: `ec2:DescribeSpotPriceHistory` and `ec2:GetSpotPlacementScores`) uses this column to tell records apart. |
+| `upstream_ref` | string | no | The URL, S3 key, either followed by `#<member>` for a table inside an archive, or the API operation name the record came from, with credentials removed. A source that calls more than one endpoint (for example `aws`: `ec2:DescribeSpotPriceHistory` and `ec2:GetSpotPlacementScores`) uses this column to tell records apart. |
 
 Payload columns follow the envelope and are passed through verbatim:
 
-- Tabular upstreams (CSV): one column per upstream column, named exactly as the upstream header, every value typed as `string`. No type inference, trimming, renaming or row filtering happens at this layer. An upstream column whose name collides with an envelope column, or with a name already assigned, is prefixed with `payload_` until it is free, and an empty header is named `unnamed_<n>` by its zero-based position. A repeated header cannot be a row key, so source adapters rename repeats with a `_<n>` suffix from the second occurrence on (`source.UniqueColumns`) before rows are built. When a source returns several parts (one file or endpoint each), their rows share one raw file and each row's `upstream_ref` and `fetched_at` come from its own part; a column one part lacks is null in that part's rows.
+- Tabular upstreams (CSV): one column per upstream column, every value typed as `string`. No type inference, trimming or row filtering happens at this layer. Column names follow the upstream header after `source.NormalizeHeader`: an empty header becomes `unnamed_<i>` from its zero-based position in that table's header, and a repeated header gets a `_<n>` suffix from its second occurrence on, because a row cannot hold two values under one name. A name that then collides with an envelope column, or with a name already assigned, is prefixed with `payload_` until it is free. Envelope columns come first and payload columns follow in header order, the union across parts with the first-seen order kept. When a source returns several parts (one table each), their rows share one raw file and each row's `upstream_ref` and `fetched_at` come from its own part; a column one part lacks is null in that part's rows.
 - JSON upstreams (REST and GraphQL APIs): one row per top-level record, with the record serialized verbatim into a single `payload_json` string column.
 - HTML upstreams (planned scrapers): one row per extracted price cell, with the extracted text in `payload_text`, the selector that produced it in `selector`, and the SHA-256 of the fetched page body in `page_sha256`.
+
+Every raw file carries a key-value metadata entry `gputick.raw` holding a JSON document (`store.RawMetadata`): the source, the run id, each part's ref, upstream version, fetched_at, bytes, sha256, header and row count, and the mapping from every upstream header name to its Parquet column. A renamed column is therefore never ambiguous, and per-part digests are available without the manifest.
+
+A store refuses a raw result that fails `source.RawResult.Validate`: a part with an empty ref, a zero `fetched_at`, a malformed digest, an empty or repeated column name, or a row key that is not a column. Nothing is written in that case.
 
 Raw files are written on every run even when the upstream body is unchanged. The manifest's `upstream_sha256` lets readers deduplicate.
 
@@ -65,7 +70,7 @@ One row per (series, run). Fields marked "proposed" go beyond the minimum agreed
 
 | Field | Type | Nullable | Description |
 |---|---|---|---|
-| `observed_at` | timestamp | no | When gputick fetched the upstream; equals `fetched_at` of the raw file. Not the time the provider last changed the price. |
+| `observed_at` | timestamp | no | When the source's fetch completed: the latest `fetched_at` across the raw file's parts (`source.RawResult.FetchedAt`). Not the time the provider last changed the price. |
 | `run_id` | string | no | Collection run. |
 | `source` | string | no | Which feed produced the row. Slugs (proposed): `skypilot`, `gpuhunt`, `aws`, `azure-retail`, `lambda`, `runpod`, `vast`, `tensordock`, `coreweave-web`, `crusoe-web`. Go package names under `internal/source/` are identifiers and may differ from slugs, for example `awsspot` for `aws`. |
 | `provider` | string | no | Lowercase provider slug: `aws`, `azure`, `gcp`, `lambda`, `runpod-secure`, `runpod-community`, `vast`, `tensordock`, `nebius`, `hyperstack`, `coreweave`, `crusoe`, and others as added. |
@@ -143,7 +148,7 @@ Each entry of `sources`:
 | `finished_at` | timestamp | no | |
 | `duration_ms` | int32 | no | |
 | `upstream_version` | string | yes | As in the raw envelope. |
-| `upstream_sha256` | string | yes | SHA-256 of the fetched body, or of the concatenated bodies for multi-endpoint sources, for deduplication. |
+| `upstream_sha256` | string | yes | For a single-part source, the SHA-256 of the fetched body. For several parts, the SHA-256 of the part digests joined with newlines in part order (`source.RawResult.SHA256`), which can be computed without holding every body. Per-part digests are in the raw file's `gputick.raw` metadata. |
 | `raw_path` | string | yes | Object key of the raw file; null when `failed`. |
 | `rows_raw` | int32 | no | Payload rows written to raw. |
 | `rows_observations` | int32 | no | Observations derived from this source. |
@@ -171,8 +176,8 @@ File naming:
 
 Mutability:
 
-- `raw/` and `manifest/` are write-once. An object key is never overwritten.
-- `obs/` is derived. On a methodology bump the files are re-derived from raw and overwritten in place under the same key; the `methodology_version` column identifies which derivation a file came from. Keeping superseded derivations under `obs-superseded/methodology=<version>/...` is proposed and not decided.
+- `raw/` and `manifest/` are write-once. An object key is never overwritten; stores enforce this atomically and return `store.ErrExists` to a second writer.
+- `obs/` is derived and contains only rows that pass `Validate`, belong to the run and have `stale = false`; a store refuses anything else. On a methodology bump the files are re-derived from raw and overwritten in place under the same key; the `methodology_version` column identifies which derivation a file came from. Keeping superseded derivations under `obs-superseded/methodology=<version>/...` is proposed and not decided.
 - `rollup/` is rebuilt from `obs/` and is the only place `stale = true` appears. Each rollup point carries its `source`, and a rollup never blends sources.
 - Data license is CC-BY-4.0. Raw snapshots mirrored from the SkyPilot catalog (Apache-2.0) and gpuhunt (MPL-2.0) retain their upstream license and attribution; see METHODOLOGY section 13.
 

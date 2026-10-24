@@ -20,11 +20,20 @@ import (
 	"github.com/HMetcalfeW/gputick/pkg/schema"
 )
 
-const runID = "20261024T120000Z-3f9a1c2e"
+const (
+	runID     = "20261024T120000Z-3f9a1c2e"
+	lambdaRef = "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/x/catalogs/v8/lambda/vms.csv"
+	runpodRef = "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/x/catalogs/v8/runpod/vms.csv"
+)
 
 var (
-	t1 = time.Date(2026, 10, 24, 12, 0, 1, 500000, time.UTC)
-	t2 = time.Date(2026, 10, 24, 12, 0, 7, 0, time.UTC)
+	t0   = time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	t1   = time.Date(2026, 10, 24, 12, 0, 1, 500000, time.UTC)
+	t2   = time.Date(2026, 10, 24, 12, 0, 7, 0, time.UTC)
+	shaA = source.HashBody([]byte("lambda body"))
+	shaB = source.HashBody([]byte("runpod body"))
+
+	envelope = []string{"source", "run_id", "fetched_at", "upstream_version", "upstream_ref"}
 )
 
 func ptr[T any](v T) *T { return &v }
@@ -39,8 +48,7 @@ func newStore(t *testing.T) *fs.Store {
 func twoPartResult() source.RawResult {
 	return source.RawResult{Parts: []source.Part{
 		{
-			Ref:             "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/x/catalogs/v7/lambda/vms.csv",
-			UpstreamVersion: "v7/a1b2c3d", FetchedAt: t1, Bytes: 100, SHA256: "aa",
+			Ref: lambdaRef, UpstreamVersion: "v8/a1b2c3d", FetchedAt: t1, Bytes: 100, SHA256: shaA,
 			Columns: []string{"InstanceType", "Price", "Region"},
 			Rows: []source.RawRow{
 				{"InstanceType": "gpu_8x_h100_sxm5", "Price": "23.92", "Region": "us-east-1"},
@@ -48,8 +56,7 @@ func twoPartResult() source.RawResult {
 			},
 		},
 		{
-			Ref:             "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/x/catalogs/v7/runpod/vms.csv",
-			UpstreamVersion: "v7/a1b2c3d", FetchedAt: t2, Bytes: 50, SHA256: "bb",
+			Ref: runpodRef, UpstreamVersion: "v8/a1b2c3d", FetchedAt: t2, Bytes: 50, SHA256: shaB,
 			Columns: []string{"InstanceType", "Price", "SpotPrice"},
 			Rows: []source.RawRow{
 				{"InstanceType": "1x_H100_SECURE", "Price": "2.99", "SpotPrice": "1.50"},
@@ -58,9 +65,9 @@ func twoPartResult() source.RawResult {
 	}}
 }
 
-// readRaw reads a raw parquet file back as one map per row, keyed by column
-// name, with strings, int64 timestamps and nil for nulls.
-func readRaw(t *testing.T, path string) ([]string, []map[string]any) {
+// readRaw reads a raw parquet file back: column names in file order, one map
+// per row (strings, int64 timestamps, nil for nulls), and the metadata record.
+func readRaw(t *testing.T, path string) ([]string, []map[string]any, store.RawMetadata) {
 	t.Helper()
 	f, err := os.Open(path)
 	require.NoError(t, err)
@@ -77,6 +84,16 @@ func readRaw(t *testing.T, path string) ([]string, []map[string]any) {
 		require.True(t, ok)
 		names[leaf.ColumnIndex] = path[0]
 	}
+
+	var meta store.RawMetadata
+	found := false
+	for _, kv := range pf.Metadata().KeyValueMetadata {
+		if kv.Key == store.RawMetadataKey {
+			require.NoError(t, json.Unmarshal([]byte(kv.Value), &meta))
+			found = true
+		}
+	}
+	require.True(t, found, "raw file carries %s metadata", store.RawMetadataKey)
 
 	r := parquet.NewGenericReader[any](pf)
 	t.Cleanup(func() { _ = r.Close() })
@@ -105,7 +122,7 @@ func readRaw(t *testing.T, path string) ([]string, []map[string]any) {
 		}
 		require.NoError(t, err)
 	}
-	return names, out
+	return names, out, meta
 }
 
 func TestWriteRaw_RoundTrip(t *testing.T) {
@@ -114,16 +131,15 @@ func TestWriteRaw_RoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "raw/source=skypilot/date=2026-10-24/hour=12/"+runID+".parquet", key)
 
-	names, rows := readRaw(t, filepath.Join(s.Root(), key))
-	assert.ElementsMatch(t, []string{"source", "run_id", "fetched_at", "upstream_version", "upstream_ref",
-		"InstanceType", "Price", "Region", "SpotPrice"}, names)
+	names, rows, meta := readRaw(t, filepath.Join(s.Root(), key))
+	assert.Equal(t, append(envelope, "InstanceType", "Price", "Region", "SpotPrice"), names,
+		"envelope first, then upstream columns in header order, union across parts")
 	require.Len(t, rows, 3)
 
 	assert.Equal(t, map[string]any{
 		"source": "skypilot", "run_id": runID, "fetched_at": t1.UnixMicro(),
-		"upstream_version": "v7/a1b2c3d",
-		"upstream_ref":     "https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/x/catalogs/v7/lambda/vms.csv",
-		"InstanceType":     "gpu_8x_h100_sxm5", "Price": "23.92", "Region": "us-east-1", "SpotPrice": nil,
+		"upstream_version": "v8/a1b2c3d", "upstream_ref": lambdaRef,
+		"InstanceType": "gpu_8x_h100_sxm5", "Price": "23.92", "Region": "us-east-1", "SpotPrice": nil,
 	}, rows[0])
 	region, ok := rows[1]["Region"].(string)
 	require.True(t, ok, "an empty upstream value stays a string, not null")
@@ -133,38 +149,54 @@ func TestWriteRaw_RoundTrip(t *testing.T) {
 	assert.Equal(t, t2.UnixMicro(), rows[2]["fetched_at"], "each row carries its own part's fetched_at")
 	assert.Nil(t, rows[2]["Region"])
 	assert.Equal(t, "1.50", rows[2]["SpotPrice"])
-	assert.Contains(t, rows[2]["upstream_ref"], "/runpod/")
+	assert.Equal(t, runpodRef, rows[2]["upstream_ref"])
+
+	assert.Equal(t, store.RawMetadata{
+		Source: "skypilot", RunID: runID,
+		Columns: []store.RawColumn{{Upstream: "InstanceType", Column: "InstanceType"}, {Upstream: "Price", Column: "Price"},
+			{Upstream: "Region", Column: "Region"}, {Upstream: "SpotPrice", Column: "SpotPrice"}},
+		Parts: []store.RawPart{
+			{Ref: lambdaRef, UpstreamVersion: "v8/a1b2c3d", FetchedAt: t1, Bytes: 100, SHA256: shaA,
+				Columns: []string{"InstanceType", "Price", "Region"}, Rows: 2},
+			{Ref: runpodRef, UpstreamVersion: "v8/a1b2c3d", FetchedAt: t2, Bytes: 50, SHA256: shaB,
+				Columns: []string{"InstanceType", "Price", "SpotPrice"}, Rows: 1},
+		},
+	}, meta)
 }
 
-func TestWriteRaw_EnvelopeCollisionsAndOddHeaders(t *testing.T) {
+func TestWriteRaw_EnvelopeCollisionsAreRenamedAndRecorded(t *testing.T) {
 	s := newStore(t)
+	header := source.NormalizeHeader([]string{"source", "", "price", "payload_source"})
+	require.Equal(t, []string{"source", "unnamed_1", "price", "payload_source"}, header)
 	raw := source.RawResult{Parts: []source.Part{{
-		Ref: "r", FetchedAt: t1,
-		Columns: []string{"source", "", "price", "payload_source"},
-		Rows:    []source.RawRow{{"source": "upstream-says-aws", "": "blank", "price": "1", "payload_source": "x"}},
+		Ref: "r", FetchedAt: t1, SHA256: shaA, Columns: header,
+		Rows: []source.RawRow{{"source": "upstream-says-aws", "unnamed_1": "blank", "price": "1", "payload_source": "x"}},
 	}}}
 	key, err := s.WriteRaw(context.Background(), runID, "gpuhunt", raw)
 	require.NoError(t, err)
 
-	names, rows := readRaw(t, filepath.Join(s.Root(), key))
-	assert.ElementsMatch(t, []string{"source", "run_id", "fetched_at", "upstream_version", "upstream_ref",
-		"payload_source", "unnamed_1", "price", "payload_payload_source"}, names)
+	names, rows, meta := readRaw(t, filepath.Join(s.Root(), key))
+	assert.Equal(t, append(envelope, "payload_source", "unnamed_1", "price", "payload_payload_source"), names)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "gpuhunt", rows[0]["source"], "the envelope keeps its name")
 	assert.Equal(t, "upstream-says-aws", rows[0]["payload_source"])
-	assert.Equal(t, "blank", rows[0]["unnamed_1"])
 	assert.Equal(t, "x", rows[0]["payload_payload_source"], "an upstream name that is itself taken is prefixed again")
 	assert.Nil(t, rows[0]["upstream_version"], "an empty upstream version is null")
+	assert.Equal(t, []store.RawColumn{
+		{Upstream: "source", Column: "payload_source"}, {Upstream: "unnamed_1", Column: "unnamed_1"},
+		{Upstream: "price", Column: "price"}, {Upstream: "payload_source", Column: "payload_payload_source"},
+	}, meta.Columns, "the metadata resolves every rename")
 }
 
-func TestWriteRaw_NoRowsStillWritesSchema(t *testing.T) {
+func TestWriteRaw_NoRowsStillWritesSchemaAndMetadata(t *testing.T) {
 	s := newStore(t)
-	raw := source.RawResult{Parts: []source.Part{{Ref: "r", FetchedAt: t1, Columns: []string{"a"}}}}
+	raw := source.RawResult{Parts: []source.Part{{Ref: "r", FetchedAt: t1, SHA256: shaA, Columns: []string{"a"}}}}
 	key, err := s.WriteRaw(context.Background(), runID, "lambda", raw)
 	require.NoError(t, err)
-	names, rows := readRaw(t, filepath.Join(s.Root(), key))
-	assert.Contains(t, names, "a")
+	names, rows, meta := readRaw(t, filepath.Join(s.Root(), key))
+	assert.Equal(t, append(envelope, "a"), names)
 	assert.Empty(t, rows)
+	assert.Equal(t, 0, meta.Parts[0].Rows)
 }
 
 func TestWriteRaw_IsWriteOnce(t *testing.T) {
@@ -178,20 +210,44 @@ func TestWriteRaw_IsWriteOnce(t *testing.T) {
 	assert.NoError(t, err, "a different source in the same run is a different key")
 }
 
-func TestWriteRaw_RejectsBadInput(t *testing.T) {
+func TestWriteRaw_RejectsInvalidInput(t *testing.T) {
 	s := newStore(t)
-	_, err := s.WriteRaw(context.Background(), "bad-run-id", "skypilot", twoPartResult())
-	require.Error(t, err)
-	_, err = s.WriteRaw(context.Background(), runID, "Sky Pilot", twoPartResult())
-	require.Error(t, err)
+	ctx := context.Background()
+	tests := []struct {
+		name    string
+		runID   string
+		source  string
+		mutate  func(r *source.RawResult)
+		wantErr string
+	}{
+		{"bad run id", "bad-run-id", "skypilot", nil, "does not match"},
+		{"bad source name", runID, "Sky Pilot", nil, "lowercase ASCII"},
+		{"zero fetched_at", runID, "skypilot", func(r *source.RawResult) { r.Parts[1].FetchedAt = time.Time{} }, "part 1 (" + runpodRef + "): fetched_at is zero"},
+		{"empty column", runID, "skypilot", func(r *source.RawResult) { r.Parts[0].Columns[1] = "" }, "column 1 is empty"},
+		{"row key outside columns", runID, "skypilot", func(r *source.RawResult) { r.Parts[0].Rows[0]["Zone"] = "lost" }, `key "Zone" that is not in columns`},
+		{"missing sha", runID, "skypilot", func(r *source.RawResult) { r.Parts[0].SHA256 = "" }, "sha256"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := twoPartResult()
+			if tt.mutate != nil {
+				tt.mutate(&raw)
+			}
+			_, err := s.WriteRaw(ctx, tt.runID, tt.source, raw)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+	assertNoFiles(t, s.Root())
+}
 
+func TestWriteRaw_CanceledContextWritesNothing(t *testing.T) {
+	s := newStore(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = s.WriteRaw(ctx, runID, "skypilot", twoPartResult())
+	_, err := s.WriteRaw(ctx, runID, "skypilot", twoPartResult())
 	require.ErrorIs(t, err, context.Canceled)
-	entries, err := os.ReadDir(s.Root())
-	require.NoError(t, err)
-	assert.Empty(t, entries, "a refused write leaves nothing behind")
+	assertNoFiles(t, s.Root())
 }
 
 func observation() schema.Observation {
@@ -212,7 +268,7 @@ func TestObservationSchema_MatchesSchemaDoc(t *testing.T) {
 	sch := parquet.SchemaOf(schema.Observation{})
 	names := make([]string, 0, len(sch.Columns()))
 	for _, p := range sch.Columns() {
-		require.Len(t, p, 1, "every column is top level, including the embedded Availability fields: %v", p)
+		require.Len(t, p, 1, "every column is top level: %v", p)
 		names = append(names, p[0])
 	}
 	assert.Equal(t, []string{
@@ -247,7 +303,7 @@ func TestWriteObservations_RoundTripAndOverwrite(t *testing.T) {
 	b := observation()
 	b.Provider, b.Source = "aws", "aws"
 	b.ZoneRaw = ptr("us-east-1a")
-	b.Stale, b.StaleSince = true, ptr(t1)
+	b.UpstreamVersion = ptr("v8/a1b2c3d")
 	b.SetAvailability(schema.Availability{Signal: schema.SignalNone})
 
 	key, err := s.WriteObservations(ctx, runID, []schema.Observation{a, b})
@@ -270,6 +326,29 @@ func TestWriteObservations_Empty(t *testing.T) {
 	key, err := s.WriteObservations(context.Background(), runID, nil)
 	require.NoError(t, err)
 	assert.Empty(t, readObservations(t, filepath.Join(s.Root(), key)))
+}
+
+func TestWriteObservations_RejectsInvariantViolations(t *testing.T) {
+	s := newStore(t)
+	tests := []struct {
+		name    string
+		mutate  func(o *schema.Observation)
+		wantErr string
+	}{
+		{"stale row", func(o *schema.Observation) { o.Stale, o.StaleSince = true, ptr(t1) }, "stale rows belong in rollups"},
+		{"foreign run", func(o *schema.Observation) { o.RunID = "20261024T110000Z-00000000" }, `run_id "20261024T110000Z-00000000" does not belong to run`},
+		{"invalid row", func(o *schema.Observation) { o.FormFactor = "SXM" }, `form_factor "SXM"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := observation()
+			tt.mutate(&o)
+			_, err := s.WriteObservations(context.Background(), runID, []schema.Observation{observation(), o})
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "observation 1: "+tt.wantErr)
+		})
+	}
+	assertNoFiles(t, s.Root())
 }
 
 func readObservations(t *testing.T, path string) []schema.Observation {
@@ -302,15 +381,19 @@ func readObservations(t *testing.T, path string) []schema.Observation {
 	}
 }
 
-func TestWriteManifest(t *testing.T) {
-	s := newStore(t)
-	m := schema.RunManifest{
-		RunID: runID, StartedAt: t1, FinishedAt: t2, CollectorVersion: "gputick dev",
+func manifest() schema.RunManifest {
+	return schema.RunManifest{
+		RunID: runID, StartedAt: t0, FinishedAt: t2, CollectorVersion: "gputick dev",
 		MethodologyVersion: schema.MethodologyVersion, Status: schema.RunStatusOK,
 		ObservationsPath: ptr("obs/date=2026-10-24/" + runID + ".parquet"), ObservationsTotal: 2,
-		Sources: []schema.SourceRun{{Source: "skypilot", Status: schema.SourceRunOK, StartedAt: t1, FinishedAt: t2,
-			DurationMillis: 5500, UnmappedRegions: []string{}}},
+		Sources: []schema.SourceRun{{Source: "skypilot", Status: schema.SourceRunOK, StartedAt: t0, FinishedAt: t2,
+			DurationMillis: 7000, UnmappedRegions: []string{}}},
 	}
+}
+
+func TestWriteManifest(t *testing.T) {
+	s := newStore(t)
+	m := manifest()
 	key, err := s.WriteManifest(context.Background(), m)
 	require.NoError(t, err)
 	assert.Equal(t, "manifest/date=2026-10-24/"+runID+".json", key)
@@ -321,27 +404,59 @@ func TestWriteManifest(t *testing.T) {
 	require.NoError(t, json.Unmarshal(data, &got))
 	assert.Equal(t, m.RunID, got.RunID)
 	assert.Equal(t, m.Sources, got.Sources)
-	assert.Contains(t, string(data), "\n  \"run_id\"", "manifests are indented for humans")
+	text := string(data)
+	assert.Contains(t, text, "\n  \"run_id\"", "manifests are indented for humans")
+	assert.Contains(t, text, `"started_at": "2026-10-24T12:00:00Z"`, "timestamps are UTC with a Z suffix")
+	for _, null := range []string{`"raw_path": null`, `"error": null`, `"upstream_sha256": null`, `"upstream_version": null`} {
+		assert.Contains(t, text, null, "null fields are present, not omitted")
+	}
 
 	_, err = s.WriteManifest(context.Background(), m)
 	require.ErrorIs(t, err, store.ErrExists)
-	_, err = s.WriteManifest(context.Background(), schema.RunManifest{RunID: "nope"})
-	assert.Error(t, err)
+}
+
+func TestWriteManifest_RejectsInvalid(t *testing.T) {
+	s := newStore(t)
+	_, err := s.WriteManifest(context.Background(), schema.RunManifest{RunID: "nope"})
+	require.Error(t, err)
+	_, err = s.WriteManifest(context.Background(), schema.RunManifest{RunID: runID})
+	require.ErrorContains(t, err, "invalid manifest")
+	m := manifest()
+	m.StartedAt = m.StartedAt.In(time.FixedZone("EDT", -4*3600))
+	_, err = s.WriteManifest(context.Background(), m)
+	require.ErrorContains(t, err, "started_at must be UTC")
+	assertNoFiles(t, s.Root())
 }
 
 func TestWrite_LeavesNoTempFiles(t *testing.T) {
 	s := newStore(t)
 	_, err := s.WriteRaw(context.Background(), runID, "skypilot", twoPartResult())
 	require.NoError(t, err)
-	var tmp []string
+	_, err = s.WriteManifest(context.Background(), manifest())
+	require.NoError(t, err)
+	var others []string
 	err = filepath.WalkDir(s.Root(), func(path string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && filepath.Ext(path) != ".parquet" {
-			tmp = append(tmp, path)
+		if err == nil && !d.IsDir() && filepath.Ext(path) != ".parquet" && filepath.Ext(path) != ".json" {
+			others = append(others, path)
 		}
 		return err
 	})
 	require.NoError(t, err)
-	assert.Empty(t, tmp)
+	assert.Empty(t, others)
+}
+
+func TestWrite_TargetDirectoryIsAFile(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, prefix := range []string{"raw", "obs", "manifest"} {
+		require.NoError(t, os.WriteFile(filepath.Join(s.Root(), prefix), []byte("x"), 0o600))
+	}
+	_, err := s.WriteRaw(ctx, runID, "skypilot", twoPartResult())
+	require.Error(t, err)
+	_, err = s.WriteObservations(ctx, runID, []schema.Observation{observation()})
+	require.Error(t, err)
+	_, err = s.WriteManifest(ctx, manifest())
+	assert.Error(t, err)
 }
 
 func TestNew_RejectsEmptyRoot(t *testing.T) {
@@ -356,16 +471,16 @@ func TestNew_RootUnderRegularFile(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestWrite_TargetDirectoryIsAFile(t *testing.T) {
-	s := newStore(t)
-	ctx := context.Background()
-	for _, prefix := range []string{"raw", "obs", "manifest"} {
-		require.NoError(t, os.WriteFile(filepath.Join(s.Root(), prefix), []byte("x"), 0o600))
-	}
-	_, err := s.WriteRaw(ctx, runID, "skypilot", twoPartResult())
-	require.Error(t, err)
-	_, err = s.WriteObservations(ctx, runID, []schema.Observation{observation()})
-	require.Error(t, err)
-	_, err = s.WriteManifest(ctx, schema.RunManifest{RunID: runID})
-	assert.Error(t, err)
+// assertNoFiles checks that nothing at all was published or left behind.
+func assertNoFiles(t *testing.T, root string) {
+	t.Helper()
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files = append(files, path)
+		}
+		return err
+	})
+	require.NoError(t, err)
+	assert.Empty(t, files)
 }

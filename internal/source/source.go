@@ -7,7 +7,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -16,23 +18,24 @@ import (
 // in the normalizer, never here.
 type RawRow map[string]string
 
-// Part is the result of one upstream request. A source that reads several
-// files or endpoints returns one Part per request so the raw envelope can
-// record where each row came from.
+// Part is one table fetched from an upstream: a CSV file, one member of an
+// archive, or one endpoint's response. A source that reads several tables
+// returns one Part per table. Bytes and SHA256 describe the table body as the
+// adapter received it (for an archive member, that member's uncompressed
+// bytes), and FetchedAt is when the request that carried it completed.
 type Part struct {
-	// Ref identifies the request: a URL, an S3 key or an API operation name,
-	// with credentials removed. It becomes the raw envelope's upstream_ref.
+	// Ref identifies the table: a URL, an S3 key, either followed by
+	// "#<member>" for a file inside an archive, or an API operation name,
+	// always with credentials removed. It becomes the envelope's upstream_ref.
 	Ref string
 	// UpstreamVersion is the upstream's own version string, empty when none.
 	UpstreamVersion string
-	// FetchedAt is when the request completed.
-	FetchedAt time.Time
-	// Bytes is the size of the fetched body.
-	Bytes int64
-	// SHA256 is the lowercase hex digest of the fetched body.
+	FetchedAt       time.Time
+	Bytes           int64
+	// SHA256 is the lowercase hex digest of the table body.
 	SHA256 string
-	// Columns is the upstream header in upstream order. Names must be unique
-	// because they are RawRow keys; see UniqueColumns.
+	// Columns is the header after NormalizeHeader: non-empty, unique names in
+	// upstream order. Every RawRow key must be one of them.
 	Columns []string
 	Rows    []RawRow
 }
@@ -47,23 +50,33 @@ type Source interface {
 	// Name is the source slug used in paths, manifests and observations.
 	Name() string
 	// Fetch performs every request the source needs and returns the raw rows.
-	// Implementations must honor ctx cancellation and must not retry forever.
+	// It is all-or-nothing: on error the result is discarded and the source is
+	// recorded as failed for the run, so an implementation must never return
+	// partial parts with a nil error. Implementations honor ctx cancellation
+	// and do not retry forever.
 	Fetch(ctx context.Context) (RawResult, error)
 }
 
-// UniqueColumns renames repeated header names with a _<n> suffix from the
-// second occurrence on, so every column can be a RawRow key. The first
-// occurrence keeps its name.
-func UniqueColumns(header []string) []string {
+var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// NormalizeHeader makes a table header usable as RawRow keys: an empty name
+// becomes unnamed_<i> from its zero-based position, and a repeated name gets
+// a _<n> suffix from its second occurrence on. The first occurrence keeps its
+// name. Adapters call it on every header before building rows.
+func NormalizeHeader(header []string) []string {
 	out := make([]string, len(header))
 	taken := make(map[string]struct{}, len(header))
 	for i, h := range header {
-		n := h
+		base := h
+		if base == "" {
+			base = fmt.Sprintf("unnamed_%d", i)
+		}
+		n := base
 		for k := 2; ; k++ {
 			if _, dup := taken[n]; !dup {
 				break
 			}
-			n = fmt.Sprintf("%s_%d", h, k)
+			n = fmt.Sprintf("%s_%d", base, k)
 		}
 		taken[n] = struct{}{}
 		out[i] = n
@@ -75,6 +88,65 @@ func UniqueColumns(header []string) []string {
 func HashBody(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// Validate checks that the part can be written as a raw snapshot without
+// losing anything: required metadata is present, columns are usable as keys,
+// and every row key is a known column.
+func (p Part) Validate() error {
+	var errs []error
+	if p.Ref == "" {
+		errs = append(errs, errors.New("ref is empty"))
+	}
+	if p.FetchedAt.IsZero() {
+		errs = append(errs, errors.New("fetched_at is zero"))
+	}
+	if p.Bytes < 0 {
+		errs = append(errs, errors.New("bytes is negative"))
+	}
+	if !sha256Pattern.MatchString(p.SHA256) {
+		errs = append(errs, errors.New("sha256 is not 64 lowercase hex characters"))
+	}
+	cols := make(map[string]struct{}, len(p.Columns))
+	for i, c := range p.Columns {
+		if c == "" {
+			errs = append(errs, fmt.Errorf("column %d is empty; apply NormalizeHeader", i))
+			continue
+		}
+		if _, dup := cols[c]; dup {
+			errs = append(errs, fmt.Errorf("column %q is repeated; apply NormalizeHeader", c))
+			continue
+		}
+		cols[c] = struct{}{}
+	}
+	if err := unknownKey(p.Rows, cols); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// unknownKey reports the first row key that is not a column. One error is
+// enough: a whole column of them would otherwise flood the message.
+func unknownKey(rows []RawRow, cols map[string]struct{}) error {
+	for i, r := range rows {
+		for k := range r {
+			if _, ok := cols[k]; !ok {
+				return fmt.Errorf("row %d has key %q that is not in columns", i, k)
+			}
+		}
+	}
+	return nil
+}
+
+// Validate validates every part, naming the part in each error.
+func (r RawResult) Validate() error {
+	var errs []error
+	for i, p := range r.Parts {
+		if err := p.Validate(); err != nil {
+			errs = append(errs, fmt.Errorf("part %d (%s): %w", i, p.Ref, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // RowCount is the total number of rows across all parts.
@@ -103,7 +175,8 @@ func (r RawResult) Columns() []string {
 }
 
 // SHA256 is a single digest for the whole fetch: the part digest when there
-// is one part, otherwise the digest of the part digests joined in order.
+// is one part, otherwise the digest of the part digests joined with newlines
+// in part order. Per-part digests are kept in the raw file's metadata.
 func (r RawResult) SHA256() string {
 	switch len(r.Parts) {
 	case 0:

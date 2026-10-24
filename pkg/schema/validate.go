@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 var (
@@ -18,6 +19,8 @@ func (o Observation) Validate() error {
 	var errs []error
 	if o.ObservedAt.IsZero() {
 		errs = append(errs, errors.New("observed_at is zero"))
+	} else if o.ObservedAt.Location() != time.UTC {
+		errs = append(errs, errors.New("observed_at must be UTC"))
 	}
 	for name, v := range map[string]string{
 		"run_id": o.RunID, "source": o.Source, "provider": o.Provider,
@@ -44,6 +47,9 @@ func (o Observation) Validate() error {
 	}
 	if !o.Stale && o.StaleSince != nil {
 		errs = append(errs, errors.New("stale_since must be null when stale is false"))
+	}
+	if o.StaleSince != nil && o.StaleSince.Location() != time.UTC {
+		errs = append(errs, errors.New("stale_since must be UTC"))
 	}
 	return errors.Join(errs...)
 }

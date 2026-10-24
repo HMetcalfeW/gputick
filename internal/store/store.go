@@ -17,6 +17,13 @@ import (
 // Store writes the three artifacts of a collection run. Each method returns
 // the object key it wrote, relative to the store root, so the run manifest
 // can record it.
+//
+// Implementations validate their input before writing anything: the raw
+// result, every observation and the manifest must pass their Validate
+// methods, observations must carry the run's id and must not be stale.
+// A context canceled before the object is published aborts the write and
+// leaves nothing behind, so a caller that must not lose a snapshot to a fetch
+// deadline writes with a context of its own.
 type Store interface {
 	// WriteRaw writes one source's raw snapshot. Raw objects are write-once;
 	// writing to a key that exists returns ErrExists.
@@ -28,10 +35,12 @@ type Store interface {
 	WriteManifest(ctx context.Context, m schema.RunManifest) (string, error)
 }
 
-// ErrExists is returned when a write-once object already exists.
-var ErrExists = errors.New("object already exists")
+var (
+	// ErrExists is returned when a write-once object already exists.
+	ErrExists = errors.New("object already exists")
 
-var sourceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	sourceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+)
 
 // RawPath is raw/source=<source>/date=YYYY-MM-DD/hour=HH/<run_id>.parquet.
 func RawPath(sourceName, runID string) (string, error) {
@@ -62,4 +71,23 @@ func ManifestPath(runID string) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("manifest/date=%s/%s.json", t.Format("2006-01-02"), runID), nil
+}
+
+// ValidateObservations checks what every store requires of an obs/ file: each
+// row validates, belongs to runID, and is not stale. Stale rows exist only in
+// rollups (docs/METHODOLOGY.md section 9).
+func ValidateObservations(runID string, obs []schema.Observation) error {
+	for i := range obs {
+		o := &obs[i]
+		if err := o.Validate(); err != nil {
+			return fmt.Errorf("observation %d: %w", i, err)
+		}
+		if o.RunID != runID {
+			return fmt.Errorf("observation %d: run_id %q does not belong to run %q", i, o.RunID, runID)
+		}
+		if o.Stale {
+			return fmt.Errorf("observation %d: stale rows belong in rollups, not obs/", i)
+		}
+	}
+	return nil
 }

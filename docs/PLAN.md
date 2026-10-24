@@ -165,7 +165,7 @@ Acceptance per source: fixture-driven unit test, contract test, one live `--once
 - 3.2 Per-source `Normalizer` for every Phase 1 and Phase 2 source.
 - 3.3 Observation writer and partition layout.
 - 3.4 Staleness carry-forward in rollups only, with `stale` and `stale_since` and the 72-hour limit from METHODOLOGY.md.
-- 3.5 Replay (proposed `collect --replay <from> <to>`) that rebuilds observations from raw snapshots.
+- 3.5 Replay (proposed `collect --replay <from> <to>`) that rebuilds observations from raw snapshots. This is where `Store` gains its read side (list and read raw objects by date range); it is deliberately absent until then.
 - 3.6 Daily and hourly rollups as static JSON, including an `effective_price` series where an availability signal exists.
 
 Acceptance: a replay over all stored raw snapshots produces identical observations to the live path; unknown GPU strings fail the normalizer test rather than passing through silently; rollup JSON for one GPU renders in a scratch chart.

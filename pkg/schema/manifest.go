@@ -38,14 +38,12 @@ type SourceRun struct {
 }
 
 // Validate checks the manifest invariants from docs/SCHEMA.md section 4.
-// Slices must be non-nil so they serialize as JSON arrays, never null.
+// Times must be UTC, the run_id prefix must be started_at to the second, and
+// slices must be non-nil so they serialize as JSON arrays, never null.
 func (m RunManifest) Validate() error {
 	var errs []error
-	if m.RunID == "" {
-		errs = append(errs, errors.New("run_id is empty"))
-	} else if _, err := RunIDTime(m.RunID); err != nil {
-		errs = append(errs, err)
-	}
+	errs = append(errs, m.validateRunID()...)
+	errs = append(errs, validateUTC("started_at", m.StartedAt, "finished_at", m.FinishedAt)...)
 	if m.FinishedAt.Before(m.StartedAt) {
 		errs = append(errs, errors.New("finished_at is before started_at"))
 	}
@@ -69,12 +67,41 @@ func (m RunManifest) Validate() error {
 	return errors.Join(errs...)
 }
 
+func (m RunManifest) validateRunID() []error {
+	if m.RunID == "" {
+		return []error{errors.New("run_id is empty")}
+	}
+	t, err := RunIDTime(m.RunID)
+	if err != nil {
+		return []error{err}
+	}
+	if !t.Equal(m.StartedAt.Truncate(time.Second)) {
+		return []error{fmt.Errorf("run_id prefix %s does not match started_at %s",
+			t.Format(time.RFC3339), m.StartedAt.UTC().Format(time.RFC3339))}
+	}
+	return nil
+}
+
+// validateUTC reports every time in the (name, value) pairs whose location is
+// not UTC. JSON encodes a time in its own location, and the contract requires
+// a Z suffix.
+func validateUTC(pairs ...any) []error {
+	var errs []error
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if t, ok := pairs[i+1].(time.Time); ok && t.Location() != time.UTC {
+			errs = append(errs, fmt.Errorf("%s must be UTC", pairs[i]))
+		}
+	}
+	return errs
+}
+
 // Validate checks one source entry.
 func (s SourceRun) Validate() error {
 	var errs []error
 	if s.Source == "" {
 		errs = append(errs, errors.New("source is empty"))
 	}
+	errs = append(errs, validateUTC("started_at", s.StartedAt, "finished_at", s.FinishedAt)...)
 	if !s.Status.Valid() {
 		errs = append(errs, fmt.Errorf("status %q is not a SourceRunStatus", s.Status))
 	}

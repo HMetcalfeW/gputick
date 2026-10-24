@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
@@ -8,6 +9,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/HMetcalfeW/gputick/internal/source"
+	"github.com/HMetcalfeW/gputick/internal/store"
 )
 
 // Envelope column names, in the order documented in docs/SCHEMA.md section 2.
@@ -30,21 +32,44 @@ type column struct {
 	maxDef   int
 }
 
-// writeRawParquet writes the envelope columns followed by every upstream
-// column as an optional string. Upstream values are passed through verbatim.
+// orderedGroup is a parquet.Group whose fields keep a given order. A plain
+// Group is a map and sorts its fields by name, which would lose the upstream
+// header order the raw file is meant to preserve.
+type orderedGroup struct {
+	parquet.Group
+	order []string
+}
+
+func (g orderedGroup) Fields() []parquet.Field {
+	byName := make(map[string]parquet.Field, len(g.Group))
+	for _, f := range g.Group.Fields() {
+		byName[f.Name()] = f
+	}
+	out := make([]parquet.Field, 0, len(g.order))
+	for _, n := range g.order {
+		out = append(out, byName[n])
+	}
+	return out
+}
+
+// writeRawParquet writes the five envelope columns followed by every upstream
+// column, in header order, as optional strings passed through verbatim. The
+// file's key-value metadata records each part and the header mapping.
 func writeRawParquet(w io.Writer, runID, sourceName string, raw source.RawResult) error {
 	upstream := raw.Columns()
 	names := payloadColumnNames(upstream)
 
-	group := parquet.Group{
+	group := orderedGroup{Group: parquet.Group{
 		colSource:          parquet.String(),
 		colRunID:           parquet.String(),
 		colFetchedAt:       parquet.Timestamp(parquet.Microsecond),
 		colUpstreamVersion: parquet.Optional(parquet.String()),
 		colUpstreamRef:     parquet.String(),
-	}
+	}}
+	group.order = append(group.order, envelopeColumns...)
 	for _, n := range names {
-		group[n] = parquet.Optional(parquet.String())
+		group.Group[n] = parquet.Optional(parquet.String())
+		group.order = append(group.order, n)
 	}
 	sch := parquet.NewSchema("raw", group)
 
@@ -58,7 +83,13 @@ func writeRawParquet(w io.Writer, runID, sourceName string, raw source.RawResult
 	// Rows must list values in column index order.
 	slices.SortFunc(cols, func(a, b column) int { return a.index - b.index })
 
-	pw := parquet.NewGenericWriter[any](w, sch, parquet.Compression(&parquet.Zstd))
+	meta, err := json.Marshal(store.NewRawMetadata(runID, sourceName, raw, names))
+	if err != nil {
+		return fmt.Errorf("encode raw metadata: %w", err)
+	}
+	pw := parquet.NewGenericWriter[any](w, sch,
+		parquet.Compression(&parquet.Zstd),
+		parquet.KeyValueMetadata(store.RawMetadataKey, string(meta)))
 	for _, part := range raw.Parts {
 		rows := make([]parquet.Row, 0, len(part.Rows))
 		for _, r := range part.Rows {
@@ -111,11 +142,11 @@ func optionalString(present bool, v string, c column) parquet.Value {
 	return parquet.ValueOf(v).Level(0, c.maxDef, c.index)
 }
 
-// payloadColumnNames maps upstream headers to parquet column names. A header
-// that collides with an envelope column, or with a name already assigned, is
-// prefixed with payload_ until it is free. An empty header is named by its
-// position. Repeated headers never reach here: RawResult.Columns is a set, and
-// adapters rename repeats with source.UniqueColumns before building rows.
+// payloadColumnNames maps upstream headers to parquet column names. Headers
+// are already non-empty and unique (source.Part.Validate); a header that
+// collides with an envelope column, or with a name already assigned, is
+// prefixed with payload_ until it is free. The mapping is recorded in the
+// file metadata so a renamed column is never ambiguous.
 func payloadColumnNames(upstream []string) []string {
 	taken := make(map[string]struct{}, len(envelopeColumns)+len(upstream))
 	for _, n := range envelopeColumns {
@@ -124,9 +155,6 @@ func payloadColumnNames(upstream []string) []string {
 	names := make([]string, len(upstream))
 	for i, h := range upstream {
 		n := h
-		if n == "" {
-			n = fmt.Sprintf("unnamed_%d", i)
-		}
 		for {
 			if _, clash := taken[n]; !clash {
 				break

@@ -1,8 +1,9 @@
 // Package fs implements store.Store on a local directory. It is the store used
 // in development and tests, and the reference for the object layout the R2
 // store must reproduce. Writes go to a temporary file in the target directory
-// and are renamed into place, so a crash never leaves a partial object at a
-// final key. A single writer is assumed, which is true of the collector.
+// and are published by rename, or by hard link for write-once keys so that a
+// second writer fails instead of replacing the first. A crash never leaves a
+// partial object at a final key.
 package fs
 
 import (
@@ -49,6 +50,9 @@ func (s *Store) WriteRaw(ctx context.Context, runID, sourceName string, raw sour
 	if err != nil {
 		return "", err
 	}
+	if err := raw.Validate(); err != nil {
+		return "", fmt.Errorf("%s: invalid raw result: %w", key, err)
+	}
 	err = s.write(ctx, key, true, func(f *os.File) error {
 		return writeRawParquet(f, runID, sourceName, raw)
 	})
@@ -62,6 +66,9 @@ func (s *Store) WriteObservations(ctx context.Context, runID string, obs []schem
 	key, err := store.ObservationsPath(runID)
 	if err != nil {
 		return "", err
+	}
+	if err := store.ValidateObservations(runID, obs); err != nil {
+		return "", fmt.Errorf("%s: %w", key, err)
 	}
 	err = s.write(ctx, key, false, func(f *os.File) error {
 		w := parquet.NewGenericWriter[schema.Observation](f, parquet.Compression(&parquet.Zstd))
@@ -81,6 +88,9 @@ func (s *Store) WriteManifest(ctx context.Context, m schema.RunManifest) (string
 	if err != nil {
 		return "", err
 	}
+	if err := m.Validate(); err != nil {
+		return "", fmt.Errorf("%s: invalid manifest: %w", key, err)
+	}
 	err = s.write(ctx, key, true, func(f *os.File) error {
 		enc := json.NewEncoder(f)
 		enc.SetIndent("", "  ")
@@ -92,18 +102,14 @@ func (s *Store) WriteManifest(ctx context.Context, m schema.RunManifest) (string
 	return key, nil
 }
 
-// write streams fn into a temporary file beside the target and renames it into
-// place. With once set, an existing target is an error and is left untouched.
+// write streams fn into a temporary file beside the target, then publishes it.
+// The context is checked again before publishing so a cancellation during fn
+// leaves no object behind.
 func (s *Store) write(ctx context.Context, key string, once bool, fn func(*os.File) error) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
 	target := filepath.Join(s.root, filepath.FromSlash(key))
-	if once {
-		if _, err := os.Lstat(target); err == nil {
-			return fmt.Errorf("%s: %w", key, store.ErrExists)
-		}
-	}
 	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
@@ -122,11 +128,43 @@ func (s *Store) write(ctx context.Context, key string, once bool, fn func(*os.Fi
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("%s: %w", key, err)
 	}
-	if err := os.Rename(tmp.Name(), target); err != nil {
+	if err := ctx.Err(); err != nil {
 		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("%s: %w", key, err)
 	}
+	if err := publish(tmp.Name(), target, once); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
 	return nil
+}
+
+// publish moves tmp to target. A write-once key uses a hard link, which fails
+// atomically when the target exists, where a rename would replace it.
+func publish(tmp, target string, once bool) error {
+	if !once {
+		return os.Rename(tmp, target)
+	}
+	if err := os.Link(tmp, target); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return store.ErrExists
+		}
+		return err
+	}
+	return os.Remove(tmp)
+}
+
+// syncDir makes the directory entry durable, so a manifest that survives a
+// crash never points at a raw file whose rename did not.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(d.Sync(), d.Close())
 }
 
 func discard(tmp *os.File, key string, cause error) error {
