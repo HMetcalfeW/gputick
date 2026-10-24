@@ -43,7 +43,8 @@ type SourceRun struct {
 func (m RunManifest) Validate() error {
 	var errs []error
 	errs = append(errs, m.validateRunID()...)
-	errs = append(errs, validateUTC("started_at", m.StartedAt, "finished_at", m.FinishedAt)...)
+	errs = appendErr(errs, CheckUTC("started_at", m.StartedAt))
+	errs = appendErr(errs, CheckUTC("finished_at", m.FinishedAt))
 	if m.FinishedAt.Before(m.StartedAt) {
 		errs = append(errs, errors.New("finished_at is before started_at"))
 	}
@@ -82,26 +83,14 @@ func (m RunManifest) validateRunID() []error {
 	return nil
 }
 
-// validateUTC reports every time in the (name, value) pairs whose location is
-// not UTC. JSON encodes a time in its own location, and the contract requires
-// a Z suffix.
-func validateUTC(pairs ...any) []error {
-	var errs []error
-	for i := 0; i+1 < len(pairs); i += 2 {
-		if t, ok := pairs[i+1].(time.Time); ok && t.Location() != time.UTC {
-			errs = append(errs, fmt.Errorf("%s must be UTC", pairs[i]))
-		}
-	}
-	return errs
-}
-
 // Validate checks one source entry.
 func (s SourceRun) Validate() error {
 	var errs []error
 	if s.Source == "" {
 		errs = append(errs, errors.New("source is empty"))
 	}
-	errs = append(errs, validateUTC("started_at", s.StartedAt, "finished_at", s.FinishedAt)...)
+	errs = appendErr(errs, CheckUTC("started_at", s.StartedAt))
+	errs = appendErr(errs, CheckUTC("finished_at", s.FinishedAt))
 	if !s.Status.Valid() {
 		errs = append(errs, fmt.Errorf("status %q is not a SourceRunStatus", s.Status))
 	}

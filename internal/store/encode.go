@@ -1,4 +1,4 @@
-package fs
+package store
 
 import (
 	"encoding/json"
@@ -9,7 +9,7 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/HMetcalfeW/gputick/internal/source"
-	"github.com/HMetcalfeW/gputick/internal/store"
+	"github.com/HMetcalfeW/gputick/pkg/schema"
 )
 
 // Envelope column names, in the order documented in docs/SCHEMA.md section 2.
@@ -24,7 +24,7 @@ const (
 var envelopeColumns = []string{colSource, colRunID, colFetchedAt, colUpstreamVersion, colUpstreamRef}
 
 // column is one leaf of the raw schema with the parquet position it landed at.
-// upstream is the header name to read from a RawRow, empty for envelope columns.
+// upstream is the row key to read from a RawRow, empty for envelope columns.
 type column struct {
 	name     string
 	upstream string
@@ -34,7 +34,8 @@ type column struct {
 
 // orderedGroup is a parquet.Group whose fields keep a given order. A plain
 // Group is a map and sorts its fields by name, which would lose the upstream
-// header order the raw file is meant to preserve.
+// header order the raw file is meant to preserve. Only Fields is overridden,
+// so rows must be written through WriteRows; GoType still reflects the map.
 type orderedGroup struct {
 	parquet.Group
 	order []string
@@ -52,10 +53,14 @@ func (g orderedGroup) Fields() []parquet.Field {
 	return out
 }
 
-// writeRawParquet writes the five envelope columns followed by every upstream
-// column, in header order, as optional strings passed through verbatim. The
-// file's key-value metadata records each part and the header mapping.
-func writeRawParquet(w io.Writer, runID, sourceName string, raw source.RawResult) error {
+// EncodeRaw validates raw and writes it as a raw snapshot: the five envelope
+// columns followed by every upstream column, in header order, as optional
+// strings passed through verbatim. The file's key-value metadata records each
+// part and the header mapping. Every store backend writes raw objects with it.
+func EncodeRaw(w io.Writer, runID, sourceName string, raw source.RawResult) error {
+	if err := raw.Validate(); err != nil {
+		return fmt.Errorf("invalid raw result: %w", err)
+	}
 	upstream := raw.Columns()
 	names := payloadColumnNames(upstream)
 
@@ -83,13 +88,13 @@ func writeRawParquet(w io.Writer, runID, sourceName string, raw source.RawResult
 	// Rows must list values in column index order.
 	slices.SortFunc(cols, func(a, b column) int { return a.index - b.index })
 
-	meta, err := json.Marshal(store.NewRawMetadata(runID, sourceName, raw, names))
+	meta, err := json.Marshal(NewRawMetadata(runID, sourceName, raw, names))
 	if err != nil {
 		return fmt.Errorf("encode raw metadata: %w", err)
 	}
 	pw := parquet.NewGenericWriter[any](w, sch,
 		parquet.Compression(&parquet.Zstd),
-		parquet.KeyValueMetadata(store.RawMetadataKey, string(meta)))
+		parquet.KeyValueMetadata(RawMetadataKey, string(meta)))
 	for _, part := range raw.Parts {
 		rows := make([]parquet.Row, 0, len(part.Rows))
 		for _, r := range part.Rows {
@@ -105,10 +110,32 @@ func writeRawParquet(w io.Writer, runID, sourceName string, raw source.RawResult
 	return pw.Close()
 }
 
+// EncodeObservations validates obs for runID and writes them as Parquet.
+func EncodeObservations(w io.Writer, runID string, obs []schema.Observation) error {
+	if err := ValidateObservations(runID, obs); err != nil {
+		return err
+	}
+	pw := parquet.NewGenericWriter[schema.Observation](w, parquet.Compression(&parquet.Zstd))
+	if _, err := pw.Write(obs); err != nil {
+		return fmt.Errorf("write observations: %w", err)
+	}
+	return pw.Close()
+}
+
+// EncodeManifest validates m and writes it as indented JSON.
+func EncodeManifest(w io.Writer, m schema.RunManifest) error {
+	if err := m.Validate(); err != nil {
+		return fmt.Errorf("invalid manifest: %w", err)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
+}
+
 func lookup(sch *parquet.Schema, name, upstream string) column {
 	leaf, ok := sch.Lookup(name)
 	if !ok {
-		panic("fs: raw schema is missing column " + name)
+		panic("store: raw schema is missing column " + name)
 	}
 	return column{name: name, upstream: upstream, index: leaf.ColumnIndex, maxDef: leaf.MaxDefinitionLevel}
 }
@@ -142,11 +169,11 @@ func optionalString(present bool, v string, c column) parquet.Value {
 	return parquet.ValueOf(v).Level(0, c.maxDef, c.index)
 }
 
-// payloadColumnNames maps upstream headers to parquet column names. Headers
-// are already non-empty and unique (source.Part.Validate); a header that
+// payloadColumnNames maps normalized upstream columns to parquet column names.
+// Columns are already non-empty and unique (source.NormalizeHeader); one that
 // collides with an envelope column, or with a name already assigned, is
-// prefixed with payload_ until it is free. The mapping is recorded in the
-// file metadata so a renamed column is never ambiguous.
+// prefixed with payload_ until it is free. The mapping is recorded in the file
+// metadata so a renamed column is never ambiguous.
 func payloadColumnNames(upstream []string) []string {
 	taken := make(map[string]struct{}, len(envelopeColumns)+len(upstream))
 	for _, n := range envelopeColumns {

@@ -95,18 +95,19 @@ func TestValidateObservations(t *testing.T) {
 }
 
 func TestNewRawMetadata(t *testing.T) {
-	at := time.Date(2026, 10, 24, 12, 0, 1, 0, time.FixedZone("EDT", -4*3600))
+	at := time.Date(2026, 10, 24, 12, 0, 1, 999, time.FixedZone("EDT", -4*3600))
 	raw := source.RawResult{Parts: []source.Part{
-		{Ref: "a", UpstreamVersion: "v1", FetchedAt: at, Bytes: 3, SHA256: "aa", Columns: []string{"source", "x"}, Rows: []source.RawRow{{"x": "1"}}},
+		{Ref: "a", UpstreamVersion: "v1", FetchedAt: at, Bytes: 3, SHA256: "aa", Header: []string{"source", ""}, Rows: []source.RawRow{{"unnamed_1": "1"}}},
 		{Ref: "b", FetchedAt: at, SHA256: "bb"},
 	}}
-	m := store.NewRawMetadata(runID, "gpuhunt", raw, []string{"payload_source", "x"})
+	m := store.NewRawMetadata(runID, "gpuhunt", raw, []string{"payload_source", "unnamed_1"})
 	assert.Equal(t, store.RawMetadata{
 		Source: "gpuhunt", RunID: runID,
-		Columns: []store.RawColumn{{Upstream: "source", Column: "payload_source"}, {Upstream: "x", Column: "x"}},
+		Columns: []store.RawColumn{{Upstream: "source", Column: "payload_source"}, {Upstream: "unnamed_1", Column: "unnamed_1"}},
 		Parts: []store.RawPart{
-			{Ref: "a", UpstreamVersion: "v1", FetchedAt: at.UTC(), Bytes: 3, SHA256: "aa", Columns: []string{"source", "x"}, Rows: 1},
-			{Ref: "b", FetchedAt: at.UTC(), SHA256: "bb", Columns: []string{}, Rows: 0},
+			{Ref: "a", UpstreamVersion: "v1", FetchedAt: at.UTC().Truncate(time.Microsecond), Bytes: 3, SHA256: "aa",
+				Header: []string{"source", ""}, Columns: []string{"source", "unnamed_1"}, Rows: 1},
+			{Ref: "b", FetchedAt: at.UTC().Truncate(time.Microsecond), SHA256: "bb", Header: []string{}, Columns: []string{}, Rows: 0},
 		},
 	}, m)
 	assert.Equal(t, time.UTC, m.Parts[0].FetchedAt.Location(), "metadata times are UTC")

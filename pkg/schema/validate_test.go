@@ -134,6 +134,16 @@ func TestAvailability_DeriveAvailable(t *testing.T) {
 	}
 }
 
+func TestCheckUTC(t *testing.T) {
+	at := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, schema.CheckUTC("t", at))
+	require.NoError(t, schema.CheckUTC("t", at.In(time.FixedZone("UTC-named-differently", 0))),
+		"any zero-offset location serializes with a Z suffix, so time.Now() on a UTC host passes")
+	err := schema.CheckUTC("started_at", at.In(time.FixedZone("EDT", -4*3600)))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "started_at must be UTC, got offset -14400 seconds")
+}
+
 func TestAvailability_Validate_UnknownSignal(t *testing.T) {
 	err := schema.Availability{Signal: "stock"}.Validate()
 	require.Error(t, err)

@@ -40,13 +40,19 @@ func validPart() source.Part {
 	return source.Part{
 		Ref: "https://example.test/a.csv", UpstreamVersion: "v7",
 		FetchedAt: time.Date(2026, 10, 24, 12, 0, 1, 0, time.UTC), Bytes: 10, SHA256: sha,
-		Columns: []string{"b", "a"}, Rows: []source.RawRow{{"a": "1", "b": "2"}, {"a": "3"}},
+		Header: []string{"b", "a"}, Rows: []source.RawRow{{"a": "1", "b": "2"}, {"a": "3"}},
 	}
+}
+
+func TestPart_Columns(t *testing.T) {
+	p := source.Part{Header: []string{"a", "", "a"}}
+	assert.Equal(t, []string{"a", "unnamed_1", "a_2"}, p.Columns())
+	assert.Empty(t, source.Part{}.Columns())
 }
 
 func TestPart_Validate(t *testing.T) {
 	require.NoError(t, validPart().Validate())
-	empty := source.Part{Ref: "r", FetchedAt: time.Now(), SHA256: sha}
+	empty := source.Part{Ref: "r", FetchedAt: time.Now().UTC(), SHA256: sha}
 	require.NoError(t, empty.Validate(), "a table with no columns and no rows is valid")
 
 	tests := []struct {
@@ -56,13 +62,17 @@ func TestPart_Validate(t *testing.T) {
 	}{
 		{"empty ref", func(p *source.Part) { p.Ref = "" }, "ref is empty"},
 		{"zero fetched_at", func(p *source.Part) { p.FetchedAt = time.Time{} }, "fetched_at is zero"},
+		{"local fetched_at", func(p *source.Part) { p.FetchedAt = p.FetchedAt.In(time.FixedZone("EDT", -4*3600)) }, "fetched_at must be UTC"},
 		{"negative bytes", func(p *source.Part) { p.Bytes = -1 }, "bytes is negative"},
 		{"empty sha", func(p *source.Part) { p.SHA256 = "" }, "sha256 is not 64 lowercase hex"},
 		{"uppercase sha", func(p *source.Part) { p.SHA256 = "2CF24DBA5FB0A30E26E83B2AC5B9E29E1B161E5C1FA7425E73043362938B9824" }, "sha256 is not"},
-		{"empty column", func(p *source.Part) { p.Columns = []string{"a", ""} }, "column 1 is empty"},
-		{"repeated column", func(p *source.Part) { p.Columns = []string{"a", "b", "a"} }, `column "a" is repeated`},
 		{"row key outside columns", func(p *source.Part) { p.Rows[1]["zzz"] = "lost" }, `row 1 has key "zzz"`},
-		{"rows without columns", func(p *source.Part) { p.Columns = nil }, "is not in columns"},
+		{"row keyed by header not columns", func(p *source.Part) {
+			p.Header = []string{"a", ""}
+			p.Rows = []source.RawRow{{"a": "1", "": "blank"}}
+		}, `row 0 has key "" that is not in columns`},
+		{"deterministic first unknown key", func(p *source.Part) { p.Rows[0]["zz"], p.Rows[0]["aa"] = "1", "2" }, `row 0 has key "aa"`},
+		{"rows without header", func(p *source.Part) { p.Header = nil }, "is not in columns"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -112,10 +122,10 @@ func TestRawResult_MultiPart(t *testing.T) {
 	t1 := time.Date(2026, 10, 24, 12, 0, 1, 0, time.UTC)
 	t2 := t1.Add(5 * time.Second)
 	r := source.RawResult{Parts: []source.Part{
-		{Ref: "p1", UpstreamVersion: "v1", FetchedAt: t2, Bytes: 3, SHA256: "aa", Columns: []string{"a", "b"}, Rows: []source.RawRow{{"a": "1"}}},
-		{Ref: "p2", UpstreamVersion: "v1", FetchedAt: t1, Bytes: 4, SHA256: "bb", Columns: []string{"b", "c"}, Rows: []source.RawRow{{"c": "1"}, {"c": "2"}}},
-		{Ref: "p3", UpstreamVersion: "v2", FetchedAt: t1, Bytes: 5, SHA256: "cc", Columns: []string{"a"}},
-		{Ref: "p4", FetchedAt: t1, Bytes: 0, SHA256: "dd", Columns: nil},
+		{Ref: "p1", UpstreamVersion: "v1", FetchedAt: t2, Bytes: 3, SHA256: "aa", Header: []string{"a", "b"}, Rows: []source.RawRow{{"a": "1"}}},
+		{Ref: "p2", UpstreamVersion: "v1", FetchedAt: t1, Bytes: 4, SHA256: "bb", Header: []string{"b", "c"}, Rows: []source.RawRow{{"c": "1"}, {"c": "2"}}},
+		{Ref: "p3", UpstreamVersion: "v2", FetchedAt: t1, Bytes: 5, SHA256: "cc", Header: []string{"a"}},
+		{Ref: "p4", FetchedAt: t1, Bytes: 0, SHA256: "dd", Header: nil},
 	}}
 	assert.Equal(t, 3, r.RowCount())
 	assert.Equal(t, []string{"a", "b", "c"}, r.Columns(), "union in first-seen order")

@@ -1,20 +1,19 @@
 // Package fs implements store.Store on a local directory. It is the store used
 // in development and tests, and the reference for the object layout the R2
-// store must reproduce. Writes go to a temporary file in the target directory
-// and are published by rename, or by hard link for write-once keys so that a
+// store must reproduce. Encoding is shared with every backend through the
+// store package; this package only publishes. Objects are built in tmp/ under
+// the root and published by rename, or by hard link for write-once keys so a
 // second writer fails instead of replacing the first. A crash never leaves a
 // partial object at a final key.
 package fs
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
-
-	"github.com/parquet-go/parquet-go"
 
 	"github.com/HMetcalfeW/gputick/internal/source"
 	"github.com/HMetcalfeW/gputick/internal/store"
@@ -50,11 +49,8 @@ func (s *Store) WriteRaw(ctx context.Context, runID, sourceName string, raw sour
 	if err != nil {
 		return "", err
 	}
-	if err := raw.Validate(); err != nil {
-		return "", fmt.Errorf("%s: invalid raw result: %w", key, err)
-	}
 	err = s.write(ctx, key, true, func(f *os.File) error {
-		return writeRawParquet(f, runID, sourceName, raw)
+		return store.EncodeRaw(f, runID, sourceName, raw)
 	})
 	if err != nil {
 		return "", err
@@ -67,15 +63,8 @@ func (s *Store) WriteObservations(ctx context.Context, runID string, obs []schem
 	if err != nil {
 		return "", err
 	}
-	if err := store.ValidateObservations(runID, obs); err != nil {
-		return "", fmt.Errorf("%s: %w", key, err)
-	}
 	err = s.write(ctx, key, false, func(f *os.File) error {
-		w := parquet.NewGenericWriter[schema.Observation](f, parquet.Compression(&parquet.Zstd))
-		if _, err := w.Write(obs); err != nil {
-			return fmt.Errorf("write observations: %w", err)
-		}
-		return w.Close()
+		return store.EncodeObservations(f, runID, obs)
 	})
 	if err != nil {
 		return "", err
@@ -88,13 +77,8 @@ func (s *Store) WriteManifest(ctx context.Context, m schema.RunManifest) (string
 	if err != nil {
 		return "", err
 	}
-	if err := m.Validate(); err != nil {
-		return "", fmt.Errorf("%s: invalid manifest: %w", key, err)
-	}
 	err = s.write(ctx, key, true, func(f *os.File) error {
-		enc := json.NewEncoder(f)
-		enc.SetIndent("", "  ")
-		return enc.Encode(m)
+		return store.EncodeManifest(f, m)
 	})
 	if err != nil {
 		return "", err
@@ -102,19 +86,20 @@ func (s *Store) WriteManifest(ctx context.Context, m schema.RunManifest) (string
 	return key, nil
 }
 
-// write streams fn into a temporary file beside the target, then publishes it.
-// The context is checked again before publishing so a cancellation during fn
-// leaves no object behind.
+// write streams fn into a temporary file under tmp/, then publishes it at
+// key. Invalid input and cancellation leave nothing behind, not even the
+// partition directory, because the target directory is created only after fn
+// has succeeded. Once the object is published the write has happened, so the
+// remaining housekeeping is logged rather than returned.
 func (s *Store) write(ctx context.Context, key string, once bool, fn func(*os.File) error) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
-	target := filepath.Join(s.root, filepath.FromSlash(key))
-	dir := filepath.Dir(target)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	tmpDir := filepath.Join(s.root, "tmp")
+	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(target)+".tmp-*")
+	tmp, err := os.CreateTemp(tmpDir, filepath.Base(key)+".*")
 	if err != nil {
 		return fmt.Errorf("%s: %w", key, err)
 	}
@@ -125,25 +110,25 @@ func (s *Store) write(ctx context.Context, key string, once bool, fn func(*os.Fi
 		return discard(tmp, key, err)
 	}
 	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("%s: %w", key, err)
+		return discard(tmp, key, err)
 	}
 	if err := ctx.Err(); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("%s: %w", key, err)
+		return discard(tmp, key, err)
+	}
+	target := filepath.Join(s.root, filepath.FromSlash(key))
+	if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil {
+		return discard(tmp, key, err)
 	}
 	if err := publish(tmp.Name(), target, once); err != nil {
-		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("%s: %w", key, err)
+		return discard(tmp, key, err)
 	}
-	if err := syncDir(dir); err != nil {
-		return fmt.Errorf("%s: %w", key, err)
-	}
+	syncDirs(s.root, filepath.Dir(target))
 	return nil
 }
 
 // publish moves tmp to target. A write-once key uses a hard link, which fails
-// atomically when the target exists, where a rename would replace it.
+// atomically when the target exists, where a rename would replace it. After a
+// successful link the temp file is removed on a best-effort basis.
 func publish(tmp, target string, once bool) error {
 	if !once {
 		return os.Rename(tmp, target)
@@ -154,11 +139,28 @@ func publish(tmp, target string, once bool) error {
 		}
 		return err
 	}
-	return os.Remove(tmp)
+	if err := os.Remove(tmp); err != nil {
+		slog.Warn("published object but could not remove its temp file",
+			"func", "fs.publish", "tmp", tmp, "err", err)
+	}
+	return nil
 }
 
-// syncDir makes the directory entry durable, so a manifest that survives a
-// crash never points at a raw file whose rename did not.
+// syncDirs fsyncs dir and each ancestor up to root so newly created partition
+// directories are durable. The object is already published, so a failure is
+// logged, not returned: reporting it would make a write that happened look
+// failed and leave a write-once key that can never be retried.
+func syncDirs(root, dir string) {
+	for d := dir; ; d = filepath.Dir(d) {
+		if err := syncDir(d); err != nil {
+			slog.Warn("directory sync failed after publish", "func", "fs.syncDirs", "dir", d, "err", err)
+		}
+		if d == root || filepath.Dir(d) == d {
+			return
+		}
+	}
+}
+
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
@@ -167,6 +169,8 @@ func syncDir(dir string) error {
 	return errors.Join(d.Sync(), d.Close())
 }
 
+// discard closes and removes the temp file; the close error is irrelevant
+// because the file is being thrown away.
 func discard(tmp *os.File, key string, cause error) error {
 	_ = tmp.Close()
 	_ = os.Remove(tmp.Name())

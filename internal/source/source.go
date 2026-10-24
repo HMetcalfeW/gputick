@@ -10,8 +10,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/HMetcalfeW/gputick/pkg/schema"
 )
 
 // RawRow is one upstream record with values kept as strings. Typing happens
@@ -22,7 +25,7 @@ type RawRow map[string]string
 // archive, or one endpoint's response. A source that reads several tables
 // returns one Part per table. Bytes and SHA256 describe the table body as the
 // adapter received it (for an archive member, that member's uncompressed
-// bytes), and FetchedAt is when the request that carried it completed.
+// bytes; for an SDK response with no body, its canonical JSON encoding).
 type Part struct {
 	// Ref identifies the table: a URL, an S3 key, either followed by
 	// "#<member>" for a file inside an archive, or an API operation name,
@@ -30,14 +33,17 @@ type Part struct {
 	Ref string
 	// UpstreamVersion is the upstream's own version string, empty when none.
 	UpstreamVersion string
-	FetchedAt       time.Time
-	Bytes           int64
+	// FetchedAt is when the request that carried the table completed. It must
+	// have a zero UTC offset; the raw column keeps microsecond precision.
+	FetchedAt time.Time
+	Bytes     int64
 	// SHA256 is the lowercase hex digest of the table body.
 	SHA256 string
-	// Columns is the header after NormalizeHeader: non-empty, unique names in
-	// upstream order. Every RawRow key must be one of them.
-	Columns []string
-	Rows    []RawRow
+	// Header is the table header exactly as received, in upstream order,
+	// including empty and repeated names. Columns derives the row keys from it.
+	Header []string
+	// Rows are keyed by Columns, never by Header.
+	Rows []RawRow
 }
 
 // RawResult is everything a Source fetched in one run.
@@ -62,7 +68,7 @@ var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // NormalizeHeader makes a table header usable as RawRow keys: an empty name
 // becomes unnamed_<i> from its zero-based position, and a repeated name gets
 // a _<n> suffix from its second occurrence on. The first occurrence keeps its
-// name. Adapters call it on every header before building rows.
+// name. Part.Columns applies it, and adapters key their rows by the result.
 func NormalizeHeader(header []string) []string {
 	out := make([]string, len(header))
 	taken := make(map[string]struct{}, len(header))
@@ -90,9 +96,12 @@ func HashBody(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// Columns returns the row keys for this table: NormalizeHeader(Header).
+func (p Part) Columns() []string { return NormalizeHeader(p.Header) }
+
 // Validate checks that the part can be written as a raw snapshot without
-// losing anything: required metadata is present, columns are usable as keys,
-// and every row key is a known column.
+// losing anything: required metadata is present and well formed, and every
+// row key is a column.
 func (p Part) Validate() error {
 	var errs []error
 	if p.Ref == "" {
@@ -100,6 +109,8 @@ func (p Part) Validate() error {
 	}
 	if p.FetchedAt.IsZero() {
 		errs = append(errs, errors.New("fetched_at is zero"))
+	} else if err := schema.CheckUTC("fetched_at", p.FetchedAt); err != nil {
+		errs = append(errs, err)
 	}
 	if p.Bytes < 0 {
 		errs = append(errs, errors.New("bytes is negative"))
@@ -107,32 +118,30 @@ func (p Part) Validate() error {
 	if !sha256Pattern.MatchString(p.SHA256) {
 		errs = append(errs, errors.New("sha256 is not 64 lowercase hex characters"))
 	}
-	cols := make(map[string]struct{}, len(p.Columns))
-	for i, c := range p.Columns {
-		if c == "" {
-			errs = append(errs, fmt.Errorf("column %d is empty; apply NormalizeHeader", i))
-			continue
-		}
-		if _, dup := cols[c]; dup {
-			errs = append(errs, fmt.Errorf("column %q is repeated; apply NormalizeHeader", c))
-			continue
-		}
-		cols[c] = struct{}{}
-	}
-	if err := unknownKey(p.Rows, cols); err != nil {
+	if err := unknownKey(p.Rows, p.Columns()); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
 
-// unknownKey reports the first row key that is not a column. One error is
-// enough: a whole column of them would otherwise flood the message.
-func unknownKey(rows []RawRow, cols map[string]struct{}) error {
+// unknownKey reports the first row with a key that is not a column, naming
+// its alphabetically first unknown key so the message is deterministic. One
+// error is enough: a whole column of them would otherwise flood the message.
+func unknownKey(rows []RawRow, columns []string) error {
+	cols := make(map[string]struct{}, len(columns))
+	for _, c := range columns {
+		cols[c] = struct{}{}
+	}
 	for i, r := range rows {
+		var unknown []string
 		for k := range r {
 			if _, ok := cols[k]; !ok {
-				return fmt.Errorf("row %d has key %q that is not in columns", i, k)
+				unknown = append(unknown, k)
 			}
+		}
+		if len(unknown) > 0 {
+			slices.Sort(unknown)
+			return fmt.Errorf("row %d has key %q that is not in columns", i, unknown[0])
 		}
 	}
 	return nil
@@ -163,7 +172,7 @@ func (r RawResult) Columns() []string {
 	var cols []string
 	seen := map[string]struct{}{}
 	for _, p := range r.Parts {
-		for _, c := range p.Columns {
+		for _, c := range p.Columns() {
 			if _, ok := seen[c]; ok {
 				continue
 			}

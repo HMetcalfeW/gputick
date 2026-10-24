@@ -33,7 +33,7 @@ This document is the field-level contract for the artifacts gputick writes: raw 
 | `timestamp` | INT64, TIMESTAMP(MICROS), UTC-adjusted | RFC 3339 string in UTC with a `Z` suffix |
 
 - Nullable fields are Parquet nulls and JSON `null`. Every field is always present in JSON; a missing key is a bug, not a null.
-- All timestamps are UTC. `Validate` rejects a `time.Time` in any other location, because `encoding/json` would otherwise emit an offset instead of the `Z` suffix.
+- All timestamps are UTC. `Validate` (through `schema.CheckUTC`) rejects a `time.Time` with a non-zero UTC offset, because `encoding/json` would emit the offset instead of the `Z` suffix; any zero-offset location passes, so `time.Now()` on a UTC host is accepted. Parquet timestamp columns keep microsecond precision, and the raw metadata truncates to match.
 - Enumerations are lowercase strings and are never stored as integer codes.
 - Parquet files use zstd compression.
 - `run_id` identifies one collection cycle across all artifacts. Format: `<YYYYMMDD>T<HHMMSS>Z-<8 lowercase hex>`, for example `20261024T120000Z-3f9a1c2e`. The prefix is the run's `started_at` in UTC, so partitions are derived from the id alone. It sorts chronologically as a string and is safe in object keys. `schema.NewRunID` and `schema.RunIDTime` implement it, and `Validate` rejects ids in any other format. A manifest's `started_at`, truncated to the second, must equal its `run_id` prefix.
@@ -58,9 +58,9 @@ Payload columns follow the envelope and are passed through verbatim:
 - JSON upstreams (REST and GraphQL APIs): one row per top-level record, with the record serialized verbatim into a single `payload_json` string column.
 - HTML upstreams (planned scrapers): one row per extracted price cell, with the extracted text in `payload_text`, the selector that produced it in `selector`, and the SHA-256 of the fetched page body in `page_sha256`.
 
-Every raw file carries a key-value metadata entry `gputick.raw` holding a JSON document (`store.RawMetadata`): the source, the run id, each part's ref, upstream version, fetched_at, bytes, sha256, header and row count, and the mapping from every upstream header name to its Parquet column. A renamed column is therefore never ambiguous, and per-part digests are available without the manifest.
+Every raw file carries a key-value metadata entry `gputick.raw` holding a JSON document (`store.RawMetadata`): the source, the run id, each part's ref, upstream version, fetched_at (microsecond precision), bytes, sha256, its header exactly as received, its normalized column names and its row count, and the mapping from every normalized column to its Parquet column. Every rename, by `NormalizeHeader` or by the `payload_` prefix, can therefore be undone from the file alone, and per-part digests are available without the manifest.
 
-A store refuses a raw result that fails `source.RawResult.Validate`: a part with an empty ref, a zero `fetched_at`, a malformed digest, an empty or repeated column name, or a row key that is not a column. Nothing is written in that case.
+A store refuses a raw result that fails `source.RawResult.Validate`: a part with an empty ref, a zero or non-UTC `fetched_at`, a malformed digest, or a row key that is not one of the part's normalized columns. Nothing is written in that case. All backends share one encoder per artifact (`store.EncodeRaw`, `store.EncodeObservations`, `store.EncodeManifest`), which is where this validation lives.
 
 Raw files are written on every run even when the upstream body is unchanged. The manifest's `upstream_sha256` lets readers deduplicate.
 
@@ -148,7 +148,7 @@ Each entry of `sources`:
 | `finished_at` | timestamp | no | |
 | `duration_ms` | int32 | no | |
 | `upstream_version` | string | yes | As in the raw envelope. |
-| `upstream_sha256` | string | yes | For a single-part source, the SHA-256 of the fetched body. For several parts, the SHA-256 of the part digests joined with newlines in part order (`source.RawResult.SHA256`), which can be computed without holding every body. Per-part digests are in the raw file's `gputick.raw` metadata. |
+| `upstream_sha256` | string | yes | Null only when the source did not succeed. For a single-part source, the SHA-256 of the fetched body. For several parts, the SHA-256 of the part digests joined with newlines in part order (`source.RawResult.SHA256`), which can be computed without holding every body. A source whose response has no body (an SDK call) hashes the canonical JSON encoding of the response it received. Per-part digests are in the raw file's `gputick.raw` metadata. |
 | `raw_path` | string | yes | Object key of the raw file; null when `failed`. |
 | `rows_raw` | int32 | no | Payload rows written to raw. |
 | `rows_observations` | int32 | no | Observations derived from this source. |
